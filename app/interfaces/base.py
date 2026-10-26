@@ -3,7 +3,7 @@ dv_file_version = '261025.01'
 """Базовые интерфейсы и DTO для адаптеров мессенджеров."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Awaitable, Optional
 
 
 @dataclass
@@ -13,6 +13,7 @@ class ChatMessage:
     user_id: str
     chat_id: str
     text: str
+    status_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
 
 @dataclass

@@ -1,16 +1,42 @@
-# docker/compose.yaml
-version: '3.8'
-
+# compose.yaml
+#
+# Файл рассчитан на запуск ИЗ КОРНЯ репозитория (/opt/dix/repdix/):
+#   cd /opt/dix/repdix
+#   docker compose up -d --build
+#   # или
+#   ./docker_build.sh
+#
+# Все пути ниже можно переопределить переменными окружения (с дефолтами для корня).
+# Если вы запускаете из другой директории — используйте эти переменные,
+# чтобы пути указывали на корень.
+#   ENV_FILE         — путь к .env (по умолчанию ./.env)
+#   APP_CONTEXT      — build context для app (по умолчанию ./ = корень репо)
+#   CONFIG_DIR       — каталог config (по умолчанию ./config)
+#   LOGS_DIR         — каталог logs (по умолчанию ./logs)
+#   DATA_DIR         — каталог data (по умолчанию ./data)
+#   REDIS_CONTEXT    — build context для redis (по умолчанию ./ = корень)
+#   REDIS_DATA_DIR   — каталог данных redis (по умолчанию ./redis/data)
+#
+# ВАЖНО: docker compose резолвит ОТНОСИТЕЛЬНЫЕ пути в env_file,
+# volumes и build.context ОТНОСИТЕЛЬНО ЭТОГО файла (compose.yaml),
+# а не относительно cwd.
 services:
   redis:
     build:
-      context: ./
+      # context: ./ (по умолчанию, относительно compose.yaml = корень)
+      context: ${REDIS_CONTEXT:-./}
       dockerfile: dockerfiles/redis.dockerfile
     container_name: repdix_redis
     restart: always
     volumes:
-      - ./redis/data:/data
-    command: redis-server /usr/local/etc/redis/redis.conf
+      # Относительно compose.yaml = ./redis/data
+      - ${REDIS_DATA_DIR:-./redis/data}:/data
+    # Пароль передаётся через --requirepass (в redis.conf requirepass НЕТ).
+    # Если REDIS_PASSWORD пуст — Redis запустится без пароля. Для прода задайте
+    # REDIS_PASSWORD в .env.
+    command: redis-server /usr/local/etc/redis/redis.conf --requirepass ${REDIS_PASSWORD}
+    # deploy.resources уважается только в `docker stack deploy` (Swarm);
+    # в `docker compose up` игнорируется, но не вредит.
     deploy:
       resources:
         limits:
@@ -20,36 +46,39 @@ services:
           cpus: '0.25'
           memory: 256M
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # -a ${REDIS_PASSWORD} обязателен: без него `redis-cli ping` вернёт
+      # NOAUTH Authentication required при установленном пароле, и контейнер
+      # навсегда останется unhealthy → app не стартует (depends_on: service_healthy).
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
 
   app:
     build:
-      context: ./
+      # context: ./ (по умолчанию, относительно compose.yaml = корень репо).
+      # В корне лежат app/ и requirements.txt — их и копирует app.dockerfile.
+      context: ${APP_CONTEXT:-./}
+      # dockerfile: dockerfiles/app.dockerfile (относительно context)
       dockerfile: dockerfiles/app.dockerfile
     container_name: repdix_app
     restart: always
     stop_grace_period: 60s
     stop_signal: SIGTERM
-    env_file: ../.env
+    # env_file: ./.env (по умолчанию, относительно compose.yaml = корень .env).
+    env_file: ${ENV_FILE:-./.env}
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
     volumes:
-      - ../config:/app/config
-      - ../logs:/app/logs
-      - ../data:/app/data
+      # По умолчанию ./config (корень репо).
+      - ${CONFIG_DIR:-./config}:/app/config
+      - ${LOGS_DIR:-./logs}:/app/logs
+      - ${DATA_DIR:-./data}:/app/data
     depends_on:
       redis:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import redis; r = redis.Redis(host='redis', port=6379); assert r.ping()\""]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
 
 networks:
   default:

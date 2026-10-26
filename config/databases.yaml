@@ -20,4 +20,4 @@ databases:
   sqlite_local:
     type: sqlite
     path: data/test.db
-    readonly: true
+    # readonly не поддерживается драйвером aiosqlite; защита — только валидатор SQL

@@ -1,5 +1,5 @@
 # app/core/llm_client.py
-dv_file_version = '261026.02'
+dv_file_version = '261026.06'
 """Клиент для работы с LLM через OpenAI-совместимый API."""
 import logging
 import os
@@ -48,7 +48,7 @@ class LLMClient:
                         model_conf[key] = ""
                     else:
                         model_conf[key] = env_val
-            
+
             # Сохраняем context_length
             ctx_len = model_conf.get('context_length', 32768)
             self._context_lengths[model_name] = int(ctx_len)
@@ -57,6 +57,27 @@ class LLMClient:
         """Возвращает список имён моделей из конфигурации."""
         models = self.config.get('models', {})
         return list(models.keys())
+
+    def resolve_model_name(self, short_name: str) -> str | None:
+        """Разрешает сокращенное имя модели в полное имя из конфигурации.
+
+        Args:
+            short_name: Сокращенное или полное имя модели.
+
+        Returns:
+            Полное имя модели, если найдено однозначно, иначе None.
+        """
+        models = self.config.get('models', {})
+        if short_name in models:
+            return short_name
+
+        prefix = short_name + "_"
+        matches = [name for name in models.keys() if name.startswith(prefix)]
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
 
     def get_context_length(self, model_name: str | None = None) -> int:
         """Возвращает лимит контекста для указанной модели.
@@ -93,6 +114,12 @@ class LLMClient:
         supports_tools = model_conf.get('supports_tools', False)
 
         api_key = model_conf.get('api_key', '')
+        base_url = model_conf.get('base_url', '')
+        if not api_key and "localhost" not in base_url and "127.0.0.1" not in base_url:
+            raise ValueError(
+                f"API key пуст для удалённой модели {name} ({base_url}). "
+                "Укажите api_key в config/models.yaml или переменную окружения."
+            )
         try:
             api_key.encode('ascii')
         except UnicodeEncodeError:
@@ -100,17 +127,18 @@ class LLMClient:
 
         if name not in self.clients:
             self.clients[name] = AsyncOpenAI(
-                base_url=model_conf.get('base_url', ''),
+                base_url=base_url,
                 api_key=api_key,
             )
 
         return self.clients[name], actual_model_name, supports_tools
 
     async def chat(
-        self,
-        messages: list[dict],
-        tools: list[dict] | None = None,
-        model_name: str | None = None,
+            self,
+            messages: list[dict],
+            tools: list[dict] | None = None,
+            model_name: str | None = None,
+            tool_choice: str | None = None,
     ) -> dict:
         """Отправляет запрос к LLM и возвращает ответ.
 
@@ -118,6 +146,7 @@ class LLMClient:
             messages: Список сообщений в формате OpenAI.
             tools: Список инструментов для tool_calls.
             model_name: Имя модели из конфигурации.
+            tool_choice: "auto", "required" или "none" (управление вызовом инструментов).
 
         Returns:
             Словарь с ответом модели (model_dump).
@@ -127,15 +156,27 @@ class LLMClient:
         kwargs: dict = {
             "model": actual_model_name,
             "messages": messages,
+            "temperature": 0.0,  # 0.0 — минимизируем галлюцинации
         }
 
         if supports_tools and tools:
             kwargs["tools"] = tools
+            if tool_choice in ("auto", "required", "none"):
+                kwargs["tool_choice"] = tool_choice
         else:
             kwargs["tools"] = NOT_GIVEN
 
-        response = await client.chat.completions.create(**kwargs)
-        return response.model_dump()
+        try:
+            response = await client.chat.completions.create(**kwargs)
+            return response.model_dump()
+        except Exception as e:
+            # Защита от ошибок LM Studio / Ollama при неподдерживаемом tool_choice
+            if "tool_choice" in str(e).lower() and "tool_choice" in kwargs:
+                logger.warning("LLM не поддерживает tool_choice='%s', повторяем без него: %s", tool_choice, e)
+                kwargs.pop("tool_choice", None)
+                response = await client.chat.completions.create(**kwargs)
+                return response.model_dump()
+            raise
 
     async def close(self) -> None:
         """Закрывает все клиенты AsyncOpenAI."""

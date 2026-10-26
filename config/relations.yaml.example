@@ -1,0 +1,24 @@
+relations:
+  sales_orders:
+    - column: customer_id
+      references: customers.id
+      description: "Связь заказа с клиентом"
+    - column: product_id
+      references: products.id
+      description: "Связь заказа с товаром"
+
+  order_items:
+    - column: order_id
+      references: sales_orders.id
+      description: "Связь позиции заказа с заказом"
+    - column: warehouse_id
+      references: warehouses.id
+      description: "Связь позиции с складом"
+
+  invoices:
+    - column: order_id
+      references: sales_orders.id
+      description: "Связь счёта с заказом"
+    - column: manager_id
+      references: employees.id
+      description: "Связь счёта с ответственным менеджером"

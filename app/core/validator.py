@@ -1,5 +1,5 @@
 # app/core/validator.py
-dv_file_version = '261025.02'
+dv_file_version = '261026.02'
 """Валидатор SQL-запросов: проверка безопасности и синтаксиса."""
 import logging
 import os
@@ -46,6 +46,20 @@ def validate_sql(sql: str) -> tuple[bool, str]:
         pattern = r'\b' + keyword + r'\b'
         if re.search(pattern, stripped_sql):
             return False, f"forbidden keyword: {keyword}"
+
+    dangerous_patterns = [
+        r"\bINTO\s+OUTFILE\b",
+        r"\bINTO\s+DUMPFILE\b",
+        r"\bFOR\s+UPDATE\b",
+        r"\bLOCK\s+IN\s+SHARE\s+MODE\b",
+        r"\bLOAD_FILE\s*\(",
+        r"\bPROCEDURE\s+\w+",
+        r"\bSLEEP\s*\(",
+        r"\bBENCHMARK\s*\(",
+    ]
+    for pat in dangerous_patterns:
+        if re.search(pat, stripped_sql):
+            return False, f"forbidden pattern: {pat}"
 
     return True, ""
 

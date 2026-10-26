@@ -1,9 +1,10 @@
 # app/main.py
-dv_file_version = '261026.04'
+dv_file_version = '261026.08'
 """Точка входа repdix: выбор адаптера и запуск event loop."""
 import asyncio
 import logging
 import logging.handlers
+from logging.handlers import RotatingFileHandler
 import os
 
 from dotenv import load_dotenv
@@ -26,20 +27,28 @@ async def main() -> None:
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
     )
 
-    # Настройка аудита в отдельный файл
+    # Настройка аудита в отдельный файл (с ротацией)
     os.makedirs('logs', exist_ok=True)
     audit_logger = logging.getLogger("audit")
     audit_logger.setLevel(logging.INFO)
     audit_logger.propagate = False
-    handler = logging.FileHandler('logs/audit.log', encoding='utf-8')
+    log_max_bytes = int(os.environ.get("LOG_MAX_BYTES") or str(100 * 1024 * 1024))
+    log_backup_count = int(os.environ.get("LOG_BACKUP_COUNT") or "5")
+    handler = RotatingFileHandler(
+        'logs/audit.log',
+        maxBytes=log_max_bytes,
+        backupCount=log_backup_count,
+        encoding='utf-8',
+    )
     handler.setFormatter(logging.Formatter('%(message)s'))
     audit_logger.addHandler(handler)
 
     db_manager = DBManager()
-    llm_client = LLMClient()
+    llm_client = LLMClient(default_model=os.environ.get("DEFAULT_MODEL", "tool_calling_model"))
     cache_manager = CacheManager(
         host=os.environ.get("REDIS_HOST", "localhost"),
-        port=int(os.environ.get("REDIS_PORT", 6379))
+        port=int(os.environ.get("REDIS_PORT") or "6379"),
+        password=os.environ.get("REDIS_PASSWORD") or None,
     )
     engine = RepdixEngine(
         db_manager=db_manager,

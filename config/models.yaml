@@ -4,7 +4,8 @@ models:
     api_key: ${LLM_TOOL_TOKEN}
     model_name: ${LLM_TOOL_MODEL}
     supports_tools: true
-    context_length: 32768
+    context_length: 200000
+#    context_length: 32768
 
   deep_analysis_model:
     base_url: ${LLM_ANALYSIS_URL}
