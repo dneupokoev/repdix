@@ -1,10 +1,11 @@
 # app/core/engine.py
-dv_file_version = '261026.07'
+dv_file_version = '261026.08'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 
 from app.core.validator import log_violation, validate_sql
 from app.interfaces.base import ChatMessage, ChatResponse
@@ -114,6 +115,22 @@ class RepdixEngine:
         text = msg.text.strip()
         audit_question = text
         audit_answer = ""
+
+        # Обработка команды /help
+        if text == "/help":
+            help_path = Path("config/help.md")
+            try:
+                if help_path.exists():
+                    content = help_path.read_text(encoding="utf-8")
+                    audit_answer = content
+                else:
+                    audit_answer = "Помощь временно недоступна. Используйте /db, /model, /sql, /history, /clear."
+            except Exception as e:
+                logger.error(f"Error reading help file: {e}")
+                audit_answer = "Помощь временно недоступна. Используйте /db, /model, /sql, /history, /clear."
+            
+            self._log_audit(msg, audit_question, audit_answer)
+            return ChatResponse(text=audit_answer)
 
         # Загрузка истории из кэша
         if self.cache_manager is not None:
