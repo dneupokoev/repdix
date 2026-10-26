@@ -1,0 +1,25 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+pymysql = "*"
+psycopg2-binary = "*"
+aiomysql = "*"
+pyyaml = "*"
+python-dotenv = "*"
+openai = "*"
+aiogram = "*"
+asyncpg = "*"
+aiosqlite = "*"
+redis = "*"
+
+[dev-packages]
+pytest = "*"
+pytest-asyncio = "*"
+black = "*"
+isort = "*"
+
+[requires]
+python_version = "3.12"

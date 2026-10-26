@@ -1,0 +1,23 @@
+databases:
+  main_db:
+    type: mysql
+    host: ${DB_MAIN_HOST}
+    port: 3306
+    user: ${DB_MAIN_USER}
+    password: ${DB_MAIN_PASSWORD}
+    database: ${DB_MAIN_NAME}
+    readonly: true
+
+  pg_local:
+    type: postgresql
+    host: localhost
+    port: 5432
+    user: postgres
+    password: ${PG_LOCAL_PASSWORD}
+    database: postgres
+    readonly: true
+
+  sqlite_local:
+    type: sqlite
+    path: data/test.db
+    readonly: true

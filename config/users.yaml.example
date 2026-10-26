@@ -1,0 +1,4 @@
+users:
+  - id: 123456789
+    name: "admin"
+    role: "admin"

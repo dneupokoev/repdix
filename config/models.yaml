@@ -1,0 +1,14 @@
+models:
+  tool_calling_model:
+    base_url: ${LLM_TOOL_URL}
+    api_key: ${LLM_TOOL_TOKEN}
+    model_name: ${LLM_TOOL_MODEL}
+    supports_tools: true
+    context_length: 32768
+
+  deep_analysis_model:
+    base_url: ${LLM_ANALYSIS_URL}
+    api_key: ${LLM_ANALYSIS_TOKEN}
+    model_name: ${LLM_ANALYSIS_MODEL}
+    supports_tools: false
+    context_length: 64000
