@@ -1,5 +1,5 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261027.03'
+dv_file_version = '261027.05'
 """Telegram-адаптер на aiogram 3."""
 import asyncio
 import logging
@@ -46,6 +46,19 @@ class TelegramAdapter(BaseChatInterface):
         self.dp.message.register(self.process_purpose, RegistrationState.waiting_for_purpose)
 
         self.dp.message.register(self.handle_message, F.text)
+
+        from aiogram.types import BotCommand
+        await self.bot.set_my_commands([
+            BotCommand(command="start", description="Запустить бота / Регистрация"),
+            BotCommand(command="help", description="Справка по всем командам"),
+            BotCommand(command="stop", description="Остановить текущий анализ"),
+            BotCommand(command="history", description="Показать историю диалога"),
+            BotCommand(command="compact", description="Сжать историю (очистить контекст)"),
+            BotCommand(command="tokens", description="Показать расход токенов контекста"),
+            BotCommand(command="clear", description="Полностью очистить историю"),
+            BotCommand(command="settings", description="Текущие настройки (БД, модель, лимиты)"),
+        ])
+
         await self.dp.start_polling(self.bot)
 
     async def handle_start_or_unknown(self, message: types.Message, state: FSMContext) -> None:
