@@ -2,9 +2,10 @@
 
 # ==============================================================================
 # Скрипт: env_sync.sh
-# Назначение: 
+# Назначение:
 # 1. Сравнивает ключи в .env и docker/.env.
 # 2. Генерирует обезличенные .env.example (удаляет ВСЕ значения, кроме безопасных).
+# Секретные переменные, помеченные комментарием "#secret", игнорируются.
 # ==============================================================================
 
 set -e
@@ -29,7 +30,8 @@ fi
 # ==============================================================================
 if [ -f "$DOCKER_ENV_FILE" ]; then
     echo -e "${YELLOW}--- Проверка соответствия ключей в $DOCKER_ENV_FILE ---${NC}"
-    
+
+    # Игнорируем строки с #secret при сравнении
     KEYS_MAIN=$(grep -v '^#' "$ENV_FILE" | grep -v '^\s*$' | cut -d= -f1 | sort)
     KEYS_DOCKER=$(grep -v '^#' "$DOCKER_ENV_FILE" | grep -v '^\s*$' | cut -d= -f1 | sort)
 
@@ -57,40 +59,55 @@ SAFE_KEYS=("ADAPTER" "DEFAULT_DB" "DEFAULT_MODEL" "REDIS_HOST" "REDIS_PORT")
 generate_example() {
     local input_file=$1
     local output_file=$2
-    
+
     echo -e "${YELLOW}--- Генерация $output_file ---${NC}"
     > "$output_file" # Очищаем файл
-    
+
     while IFS= read -r line || [ -n "$line" ]; do
-        # Если пустая строка или комментарий — оставляем как есть
-        if [[ -z "$line" || "$line" == \#* ]]; then
+        # Если пустая строка — оставляем как есть
+        if [[ -z "$line" ]]; then
             echo "$line" >> "$output_file"
-        else
-            key=$(echo "$line" | cut -d= -f1)
-            val=$(echo "$line" | cut -d= -f2-)
-            
-            is_safe=false
-            for safe_key in "${SAFE_KEYS[@]}"; do
-                if [ "$key" == "$safe_key" ]; then
-                    is_safe=true
-                    break
-                fi
-            done
-            
-            if [ "$is_safe" = true ]; then
-                # Оставляем безопасное значение
-                echo "$line" >> "$output_file"
-            elif [[ "$key" == "ALLOWED_USERS" ]]; then
-                # Для ID пользователей оставляем заглушку
-                echo "$key=123456789" >> "$output_file"
-            else
-                # ВСЕ ОСТАЛЬНЫЕ значения удаляем (заменяем на пустую строку)
-                # Чтобы было понятно, что это надо заполнить, можно добавить комментарий
-                echo "$key=" >> "$output_file"
+            continue
+        fi
+
+        # Если это комментарий
+        if [[ "$line" == \#* ]]; then
+            # Если это #secret — НЕ КОПИРУЕМ
+            if [[ "$line" == "#secret"* ]]; then
+                continue
             fi
+            # Обычный комментарий — оставляем
+            echo "$line" >> "$output_file"
+            continue
+        fi
+
+        # Это переменная
+        key=$(echo "$line" | cut -d= -f1)
+        val=$(echo "$line" | cut -d= -f2-)
+
+        is_safe=false
+        for safe_key in "${SAFE_KEYS[@]}"; do
+            if [ "$key" == "$safe_key" ]; then
+                is_safe=true
+                break
+            fi
+        done
+
+        if [ "$is_safe" = true ]; then
+            # Оставляем безопасное значение
+            echo "$line" >> "$output_file"
+        elif [[ "$key" == "ALLOWED_USERS" ]]; then
+            # Для ID пользователей оставляем заглушку
+            echo "$key=123456789" >> "$output_file"
+        elif [[ "$key" == "ADMIN_USERS" ]]; then
+            # Для админов тоже оставляем заглушку
+            echo "$key=123456789" >> "$output_file"
+        else
+            # ВСЕ ОСТАЛЬНЫЕ значения удаляем (заменяем на пустую строку)
+            echo "$key=" >> "$output_file"
         fi
     done < "$input_file"
-    
+
     echo -e "${GREEN}Создан: $output_file${NC}"
 }
 
@@ -105,4 +122,4 @@ else
     echo -e "${YELLOW}Файл $DOCKER_ENV_FILE не найден. Пропускаем генерацию для docker/.${NC}"
 fi
 
-echo -e "${GREEN}Готово! Файлы .env.example безопасны для коммита.${NC}"
+echo -e "${GREEN}Готово! Файлы .env.example безопасны для коммита."

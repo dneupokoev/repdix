@@ -1,5 +1,5 @@
 # app/main.py
-dv_file_version = '261026.08'
+dv_file_version = '261027.01'
 """Точка входа repdix: выбор адаптера и запуск event loop."""
 import asyncio
 import logging
@@ -50,11 +50,18 @@ async def main() -> None:
         port=int(os.environ.get("REDIS_PORT") or "6379"),
         password=os.environ.get("REDIS_PASSWORD") or None,
     )
+    
+    # Инициализация менеджера пользователей
+    from app.core.user_manager import UserManager
+    user_manager = UserManager()
+    await user_manager.init_db()
+    
     engine = RepdixEngine(
         db_manager=db_manager,
         llm_client=llm_client,
         cache_manager=cache_manager,
-        default_db=os.environ.get("DEFAULT_DB")
+        default_db=os.environ.get("DEFAULT_DB"),
+        user_manager=user_manager
     )
 
     adapter_name = os.environ.get("ADAPTER", "cli").lower()

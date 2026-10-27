@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261026.80'
+dv_file_version = '261027.01'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 import asyncio
 import json
@@ -67,11 +67,12 @@ EXECUTE_TEMPLATE_TOOL = {
 class RepdixEngine:
     """Главный диспетчер: принимает ChatMessage, возвращает ChatResponse."""
 
-    def __init__(self, db_manager=None, llm_client=None, cache_manager=None, default_db: str | None = None) -> None:
+    def __init__(self, db_manager=None, llm_client=None, cache_manager=None, default_db: str | None = None, user_manager=None) -> None:
         self.db_manager = db_manager
         self.llm_client = llm_client
         self.cache_manager = cache_manager
         self.default_db = default_db
+        self.user_manager = user_manager
         self.sessions = SessionStore(default_db=default_db)
         self.max_history = 10
         self.tool_model = "tool_calling_model"
