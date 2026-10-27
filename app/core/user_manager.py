@@ -1,28 +1,27 @@
 # app/core/user_manager.py
-dv_file_version = '261027.04'
+dv_file_version = '261028.05'
 """Управление пользователями repdix через config/users.yaml.
 
-Ключевые изменения версии 261027.04:
-- Добавлен публичный delete_user() — используется адаптером Telegram при reset.
-  Раньше адаптер лез в приватные _lock/_load_users_yaml/_save_users_yaml.
-- add_user() защищает админов: если user_id есть в ADMIN_USERS или в YAML с
-  ролью admin — заявка НЕ перезаписывает запись (иначе админ мог случайно
-  потерять права, пройдя регистрацию).
-- approve_user(): дефолтная роль viewer снабжена предупреждением в лог —
-  viewer не имеет доступа к таблицам, пользователь не увидит данных.
-  Добавлен параметр roles (список), чтобы можно было одобрить сразу с
-  рабочей ролью (например, sales_manager).
-- sync_admins(): при добавлении нового админа дополняются поля comment/meta,
-  чтобы структура совпадала с add_user (иначе YAML получался разной формы).
-- _load_users_yaml(): защита от битого YAML — кэш не сбрасывается при ошибке.
-- _save_users_yaml(): при ошибке записи кэш НЕ обновляется (иначе in-memory
-  состояние разойдётся с файлом).
-- Все публичные методы возвращают bool (успех/неудача) — удобно для адаптера.
-- Валидация user_id: должен быть непустой строкой из цифр (Telegram ID).
-- update_user_profile(): не перезаписывает username пустой строкой, если
-  у пользователя уже был username (иначе при отсутствии username в Telegram
-  старое значение затиралось).
-- Docstring в шапке вместо заглушки.
+Ключевые изменения версии 261028.05:
+- ДОБАВЛЕНО поле telegram_name. Раньше update_user_profile перезаписывал
+  full_name (ФИО из регистрации) на Telegram-имя при каждом /start —
+  данные терялись. Теперь ФИО из регистрации хранится в full_name и НЕ
+  перезаписывается, а Telegram-имя — в отдельном поле telegram_name.
+- ДОБАВЛЕНЫ методы для админ-панели:
+    * list_users(exclude_admins=True) — список пользователей (dict).
+    * list_users_paginated(page, per_page, exclude_admins=True) — постранично.
+    * set_user_roles(user_id, roles) — ЗАМЕНИТЬ роли (не добавить).
+    * toggle_user_active(user_id) -> (ok, new_active) — переключить is_active.
+    * set_user_full_name(user_id, full_name) — изменить ФИО вручную (админ).
+- update_user_profile теперь обновляет username и telegram_name,
+  full_name НЕ трогает. Это исправляет баг с потерей ФИО.
+- _USERS_HEADER дополнен описанием telegram_name.
+- add_user и sync_admins создают запись с telegram_name: "".
+- Валидация: set_user_roles / toggle_user_active не трогают env-админов.
+- list_users сортирует по (is_active desc, full_name asc) для удобства.
+- set_user_roles: если roles=None или [] — сохраняет пустой список (это
+  валидное состояние: пользователь активен, но без доступа к таблицам).
+- toggle_user_active не позволяет заблокировать env-админа.
 """
 
 import asyncio
@@ -41,15 +40,16 @@ _USERS_HEADER = (
     "# База пользователей repdix\n"
     "# ==========================================================\n"
     "# Поля:\n"
-    "#   id         — Telegram ID пользователя\n"
-    "#   username   — Telegram логин (без @)\n"
-    "#   full_name  — ФИО\n"
-    "#   department — Отдел / Должность (из регистрации)\n"
-    "#   purpose    — Цель доступа (из регистрации)\n"
-    "#   is_active  — true / false\n"
-    "#   roles      — список ролей (admin, sales_manager...)\n"
-    "#   comment    — Заметки администратора\n"
-    "#   meta       — JSON с произвольными данными (db_login, branch_id...)\n"
+    "#   id            — Telegram ID пользователя\n"
+    "#   username      — Telegram логин (без @)\n"
+    "#   full_name     — ФИО (вводится при регистрации, НЕ перезаписывается)\n"
+    "#   telegram_name — Имя из Telegram-профиля (обновляется при /start)\n"
+    "#   department    — Отдел / Должность (из регистрации)\n"
+    "#   purpose       — Цель доступа (из регистрации)\n"
+    "#   is_active     — true / false\n"
+    "#   roles         — список ролей (admin, sales_manager...)\n"
+    "#   comment       — Заметки администратора\n"
+    "#   meta          — JSON с произвольными данными (db_login, branch_id...)\n"
     "# ==========================================================\n\n"
 )
 
@@ -161,6 +161,76 @@ class UserManager:
         return str(user_id) in self.admins
 
     # ------------------------------------------------------------------
+    # Список пользователей (для админ-панели)
+    # ------------------------------------------------------------------
+    def list_users(self, exclude_admins: bool = True) -> list[dict]:
+        """Возвращает список пользователей (dict).
+
+        Args:
+            exclude_admins: если True — исключает env-админов (из ADMIN_USERS).
+                Админов из YAML (роль admin, но не в env) НЕ исключает —
+                их можно редактировать.
+
+        Returns:
+            Список словарей, отсортированный по (is_active desc, full_name asc).
+        """
+        users = self._load_users_yaml()
+        result: list[dict] = []
+        for uid, u in users.items():
+            if exclude_admins and uid in self.admins:
+                continue
+            result.append(u)
+
+        # Сортировка: активные — выше, потом по ФИО
+        def sort_key(u: dict):
+            is_active = 0 if u.get("is_active") else 1
+            name = str(u.get("full_name") or u.get("username") or u.get("id") or "")
+            return (is_active, name.lower())
+
+        result.sort(key=sort_key)
+        return result
+
+    def list_users_paginated(
+        self,
+        page: int,
+        per_page: int = 10,
+        exclude_admins: bool = True,
+    ) -> tuple[list[dict], int]:
+        """Возвращает страницу пользователей и общее количество.
+
+        Returns:
+            (users_on_page, total_users)
+        """
+        all_users = self.list_users(exclude_admins=exclude_admins)
+        total = len(all_users)
+        start = max(0, page) * per_page
+        end = start + per_page
+        return all_users[start:end], total
+
+    def find_user(self, query: str) -> dict | None:
+        """Ищет пользователя по ID или username (без @, регистронезависимо)."""
+        if not query:
+            return None
+        q = str(query).strip().lstrip("@").lower()
+        if not q:
+            return None
+
+        # 1) По ID (если цифры)
+        if re.fullmatch(r"\d+", q):
+            user = self.get_user(q)
+            if user:
+                return user
+
+        # 2) По username
+        users = self._load_users_yaml()
+        for uid, u in users.items():
+            uname = str(u.get("username") or "").lower()
+            if uname and uname == q:
+                return u
+
+        return None
+
+    # ------------------------------------------------------------------
     # Сохранение users.yaml (атомарное)
     # ------------------------------------------------------------------
     def _save_users_yaml(self, users_data: dict) -> bool:
@@ -266,6 +336,7 @@ class UserManager:
                 "id": uid,
                 "username": username or "",
                 "full_name": full_name or "",
+                "telegram_name": "",
                 "department": department or "",
                 "purpose": purpose or "",
                 "is_active": False,
@@ -373,10 +444,14 @@ class UserManager:
     async def update_user_profile(
         self, user_id: str, username: str, full_name: str,
     ) -> bool:
-        """Обновляет username и full_name, не трогая остальные поля.
+        """Обновляет username и telegram_name, НЕ трогая full_name.
 
-        Пустой username НЕ перезаписывает уже сохранённый (в Telegram username
-        опционален — при его отсутствии не затираем старое значение).
+        ВАЖНО (фикс бага 261028.05): раньше метод перезаписывал full_name
+        на Telegram-имя при каждом /start — ФИО из регистрации терялось.
+        Теперь full_name не трогается, а Telegram-имя пишется в telegram_name.
+
+        Пустой username не перезаписывает сохранённый (в Telegram username
+        опционален). Пустой full_name не перезаписывает telegram_name.
         """
         uid = self._validate_user_id(user_id)
         if uid is None:
@@ -391,13 +466,89 @@ class UserManager:
             if username and users[uid].get("username") != username:
                 users[uid]["username"] = username
                 changed = True
-            if full_name and users[uid].get("full_name") != full_name:
-                users[uid]["full_name"] = full_name
+            if full_name and users[uid].get("telegram_name") != full_name:
+                users[uid]["telegram_name"] = full_name
                 changed = True
 
             if changed:
                 return self._save_users_yaml(users)
             return True
+
+    async def set_user_full_name(self, user_id: str, full_name: str) -> bool:
+        """Устанавливает full_name (ФИО) вручную. Для админ-панели.
+
+        В отличие от update_user_profile, здесь явно меняется full_name.
+        """
+        uid = self._validate_user_id(user_id)
+        if uid is None or not full_name:
+            return False
+
+        async with self._lock:
+            users = self._load_users_yaml().copy()
+            if uid not in users:
+                return False
+            if users[uid].get("full_name") == full_name:
+                return True
+            users[uid]["full_name"] = full_name
+            return self._save_users_yaml(users)
+
+    async def set_user_roles(self, user_id: str, roles: list[str]) -> bool:
+        """Заменяет список ролей пользователя (для админ-панели).
+
+        В отличие от approve_user, здесь роли ЗАМЕНЯЮТСЯ, а не добавляются.
+        Пустой список валиден (пользователь активен, но без доступа к таблицам).
+
+        env-админов не трогаем: у них всегда должна быть роль admin.
+
+        Returns:
+            True при успехе.
+        """
+        uid = self._validate_user_id(user_id)
+        if uid is None:
+            return False
+        if uid in self.admins:
+            logger.warning("set_user_roles: %s — env-админ, изменение ролей запрещено", uid)
+            return False
+
+        # Нормализуем: убираем пустые/дубликаты, сохраняем порядок
+        cleaned: list[str] = []
+        for r in roles or []:
+            r_str = str(r).strip()
+            if r_str and r_str not in cleaned:
+                cleaned.append(r_str)
+
+        async with self._lock:
+            users = self._load_users_yaml().copy()
+            if uid not in users:
+                return False
+            users[uid]["roles"] = cleaned
+            return self._save_users_yaml(users)
+
+    async def toggle_user_active(self, user_id: str) -> tuple[bool, bool]:
+        """Переключает is_active пользователя (для админ-панели).
+
+        env-админов не трогаем: их нельзя заблокировать через бота.
+
+        Returns:
+            (ok, new_active):
+              - ok: True при успехе.
+              - new_active: новое значение is_active (False при ошибке).
+        """
+        uid = self._validate_user_id(user_id)
+        if uid is None:
+            return False, False
+        if uid in self.admins:
+            logger.warning("toggle_user_active: %s — env-админ, блокировка запрещена", uid)
+            return False, False
+
+        async with self._lock:
+            users = self._load_users_yaml().copy()
+            if uid not in users:
+                return False, False
+            new_active = not bool(users[uid].get("is_active", False))
+            users[uid]["is_active"] = new_active
+            ok = self._save_users_yaml(users)
+            return ok, new_active
 
     async def update_user_notes(
         self,
@@ -432,8 +583,8 @@ class UserManager:
 
         Гарантирует, что все ID из .env имеют роль 'admin' и is_active: True.
         Принудительно восстанавливает права, если админ был понижен в YAML.
-        При добавлении нового админа дополняет запись полями comment/meta
-        (чтобы структура совпадала с add_user).
+        При добавлении нового админа дополняет запись полями comment/meta/
+        telegram_name (чтобы структура совпадала с add_user).
         """
         async with self._lock:
             users = self._load_users_yaml().copy()
@@ -446,6 +597,7 @@ class UserManager:
                         "id": uid,
                         "username": "",
                         "full_name": f"Администратор {uid}",
+                        "telegram_name": "",
                         "department": "Admin",
                         "purpose": "System Administrator",
                         "is_active": True,

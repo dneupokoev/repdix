@@ -115,7 +115,7 @@ def _strip_comments_for_check(sql: str) -> str:
     # Многострочные
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
     # Однострочные -- и #
-    sql = re.sub(r"(?<![\w-])--\s[^\n]*", " ", sql)
+    sql = re.sub(r"(?<![\w-])--(\s[^\n]*)?$", " ", sql, flags=re.MULTILINE)
     sql = re.sub(r"#[^\n]*", " ", sql)
     return sql
 

@@ -159,6 +159,11 @@ class DBManager:
 
             # aiomysql не поддерживает multi-statement в init_command.
             # Поэтому выбираем ОДИН SET-запрос.
+            # ВАЖНО: при readonly=True и MySQL (не MariaDB) MAX_EXECUTION_TIME
+            # НЕ ставится — таймаут запроса на уровне БД не работает.
+            # Если нужен и readonly, и таймаут — используйте пользователя БД
+            # с правами только на SELECT (рекомендуется), либо снимите readonly
+            # и полагайтесь на RBAC + validator.
             if is_readonly and not is_mariadb:
                 init_cmd = "SET SESSION transaction_read_only = 1"
             elif not is_readonly and not is_mariadb:
