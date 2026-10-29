@@ -1,6 +1,13 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261029.01'
+dv_file_version = '261029.02'
 """Telegram-адаптер на aiogram 3.
+
+Ключевые изменения версии 261029.02:
+- Статусы (send_status внутри handle_message) отправляются с
+  parse_mode="HTML": прежний html.escape() превращал <b> модели в
+  &lt;b&gt;, и разметка показывалась текстом. html.escape убран — статус
+  формирует LLM, а не пользователь. При ошибке разметки (незакрытый тег,
+  одиночный '<') статус дублируется без parse_mode — бот не падает.
 
 Ключевые изменения версии 261029.01:
 - Исходящие ответы движка отправляются с parse_mode="HTML":
@@ -1388,11 +1395,22 @@ class TelegramAdapter(BaseChatInterface):
                 return
 
         async def send_status(status_text: str):
+            # ВАЖНО: html.escape здесь НЕ применяется. status_text формирует
+            # LLM (по промпту — <b>/<code>), экранирование превратило бы
+            # теги в &lt;b&gt; и они показались бы пользователю текстом.
             try:
-                safe = html.escape(status_text)
-                await message.answer(safe, parse_mode=None)
+                await message.answer(status_text, parse_mode="HTML")
             except Exception as e:
-                logger.warning("Failed to send status: %s", e)
+                # Fallback: некорректная разметка (незакрытый тег, одиночный
+                # '<') — шлём без parse_mode, чтобы бот не упал.
+                logger.warning(
+                    "Failed to send status with HTML (%s), retrying as plain text",
+                    e,
+                )
+                try:
+                    await message.answer(status_text, parse_mode=None)
+                except Exception as e2:
+                    logger.warning("Failed to send status: %s", e2)
 
         msg = ChatMessage(
             user_id=user_id,

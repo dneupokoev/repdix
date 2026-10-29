@@ -1,6 +1,12 @@
 # app/core/engine.py
-dv_file_version = '261029.14'
+dv_file_version = '261029.15'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
+
+Ключевые изменения версии 261029.15:
+- Статусы (status_callback) отдаются с HTML-разметкой модели: убрана обрезка
+  через _shorten_text (она могла разорвать <b>...</b> и порождала
+  "Can't parse entities" в Telegram). Вместо обрезки — нормализация
+  пробелов в одну строку, теги при этом не затрагиваются.
 
 Ключевые изменения версии 261029.14:
 - В промпт добавлен отдельный блок "ПРАВИЛА SQL": имена таблиц, колонок и
@@ -1377,10 +1383,15 @@ class RepdixEngine:
 
                     # Статус — только если модель реально вызывает инструмент
                     if tool_calls and msg.status_callback:
-                        clean_text = (choice.get("content") or "").strip()
+                        # ВАЖНО: НЕ обрезаем текст (_shorten_text) — обрезка
+                        # могла разорвать HTML-тег (<b>...</b>) и Telegram
+                        # отвечал "Can't parse entities". Разметку отдаём как
+                        # есть, лишь схлопываем пробелы в одну строку.
+                        clean_text = re.sub(
+                            r"\s+", " ", choice.get("content") or "",
+                        ).strip()
                         if clean_text:
-                            short_text = self._shorten_text(clean_text, max_len=80)
-                            await msg.status_callback(f"🤖 {short_text}")
+                            await msg.status_callback(f"🤖 {clean_text}")
                         else:
                             tool_name = tool_calls[0]["function"]["name"]
                             await msg.status_callback(f"🤖 Выполняю {tool_name}...")
