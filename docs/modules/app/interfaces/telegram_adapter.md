@@ -2,7 +2,7 @@
 
 ## Назначение
 
-Модуль реализует Telegram-интерфейс проекта Repdix на базе `aiogram 3`. Версия файла: `261028.07`.
+Модуль реализует Telegram-интерфейс проекта Repdix на базе `aiogram 3`. Версия файла: `261028.08`; в docstring перечислены ключевые изменения версии `261028.07`.
 
 Основные задачи:
 
@@ -18,9 +18,20 @@
 
 Класс `TelegramAdapter` наследует `BaseChatInterface` и является адаптером между Telegram и ядром приложения.
 
+## Ключевые особенности доступа
+
+- `/users` доступна только env-админам из `ADMIN_USERS`.
+- Меню команд: базовый набор — всем, расширенный с `/users` — только env-админам через `BotCommandScopeChat`.
+- Регистрация `Command("users")` с фильтром по `F.from_user.id.in_(env_admin_ids)`; для не-env-админов хэндлер не вызывается.
+- Fallback `handle_users_forbidden` ловит `/users` от не-env-админов и отвечает отказом.
+- `handle_admin_callback` и `_handle_admin_role_choice` защищены проверкой `is_env_admin`.
+- Модерация заявок (`approve_*`, `reject_*`, `reset_*`) по дизайну доступна всем администраторам: и env-админам, и пользователям с YAML-ролью `admin`.
+- `handle_users_command` дополнительно проверяет `is_env_admin`.
+- `_refresh_admin_commands()` переустанавливает per-chat меню для env-админов при старте. Если `ADMIN_USERS` изменится, нужен перезапуск бота или повторный вызов метода.
+
 ## Основные константы
 
-- `SERVICE_COMMANDS` — служебные команды, которые не должны перехватываться основной логикой доступа. `/users` в этот набор намеренно не включён.
+- `SERVICE_COMMANDS` — служебные команды, которые не должны перехватываться основной логикой доступа: `/start`, `/help`, `/stop`, `/history`, `/compact`, `/tokens`, `/clear`, `/settings`, `/db`, `/model`, `/models`, `/sql`. `/users` в этот набор намеренно не включён.
 - `ROLES_PER_PAGE = 6` — количество ролей на странице выбора.
 - `USERS_PER_PAGE = 10` — количество пользователей на странице `/users`.
 - `SHOW_ADMIN_ROLE = False` — роль `admin` по умолчанию скрыта в списке выбора ролей.
@@ -73,57 +84,61 @@
   - обработчик не-текстовых сообщений;
   - общий обработчик текстовых сообщений.
 
-### Старт и регистрация пользователей
+### Старт, доступ и регистрация пользователей
 
-- `handle_start_or_unknown(message: types.Message, state: FSMContext | None) -> None` — обрабатывает `/start` и незнакомые сообщения. Проверяет, является ли пользователь админом, активным пользователем или заявителем на рассмотрении. Если пользователь новый — запускает FSM-регистрацию.
+- `handle_start_or_unknown(message: types.Message, state: FSMContext | None) -> None` — обрабатывает `/start` и незнакомые сообщения. Проверяет, является ли пользователь админом, активным пользователем или заявителем на рассмотрении. Для известных пользователей обновляет профиль. Если пользователь новый — запускает FSM-регистрацию.
 - `handle_stop(message: types.Message) -> None` — отменяет текущую задачу анализа пользователя, если она есть.
-- `process_name(message, state)` — принимает ФИО, требует минимум два слова.
-- `process_department(message, state)` — принимает отдел/должность.
-- `process_purpose(message, state)` — принимает цель доступа, сохраняет заявку через `user_manager.add_user(...)` и отправляет уведомление всем администраторам из `user_manager.admins`.
+- `process_name(message: types.Message, state: FSMContext)` — принимает ФИО, требует минимум два слова.
+- `process_department(message: types.Message, state: FSMContext)` — принимает отдел/должность.
+- `process_purpose(message: types.Message, state: FSMContext)` — принимает цель доступа, сохраняет заявку через `user_manager.add_user(...)` и отправляет уведомление всем администраторам из `user_manager.admins`. Если `ADMIN_USERS` пуст, пишет предупреждение в лог и никому не отправляет заявку.
 
 ### Роли
 
-- `_load_roles() -> list[dict]` — загружает роли из `config/roles.yaml`. Обрабатывает отсутствие файла, ошибки YAML и некорректные записи. По умолчанию скрывает роль `admin`, если `SHOW_ADMIN_ROLE=False`.
-- `_build_roles_keyboard(roles, selected, page, total_pages, prefix="arole_", done_label="💾 Применить", cancel_label="🚫 Отмена") -> InlineKeyboardMarkup` — строит универсальную клавиатуру выбора ролей с чек-боксами, пагинацией, кнопками «все на странице», «снять на странице», «применить» и «отмена».
-- `_render_roles_message(user_data, roles, selected, page, total_pages, title="🔔 <b>Одобрение заявки</b>", show_purpose=True, show_status=False) -> str` — формирует текст экрана выбора ролей.
+- `_load_roles() -> list[dict]` — загружает роли из `config/roles.yaml`. Обрабатывает отсутствие файла, ошибки YAML и некорректные записи. По умолчанию скрывает роль `admin`, если `SHOW_ADMIN_ROLE=False`. Сортирует роли: `viewer` первой, далее по имени.
+- `_build_roles_keyboard(roles: list[dict], selected: set[int], page: int, total_pages: int, prefix: str = "arole_", done_label: str = "💾 Применить", cancel_label: str = "🚫 Отмена") -> InlineKeyboardMarkup` — строит универсальную клавиатуру выбора ролей с чек-боксами, пагинацией, кнопками «все на странице», «снять на странице», «применить» и «отмена».
+- `_render_roles_message(user_data: dict, roles: list[dict], selected: set[int], page: int, total_pages: int, title: str = "🔔 <b>Одобрение заявки</b>", show_purpose: bool = True, show_status: bool = False) -> str` — формирует текст экрана выбора ролей. Экранирует пользовательские данные, при необходимости показывает цель и статус, обрезает описание роли до `ROLE_DESC_MAX_LEN`.
 
 ### Модерация заявок
 
 - `handle_approval(callback: types.CallbackQuery, state: FSMContext) -> None` — обрабатывает `approve_*`, `reject_*`, `reset_*`.
   - Доступно всем администраторам (`is_admin`), включая env-админов и YAML-роли `admin`.
-  - При одобрении открывает экран выбора ролей.
-  - При отклонении помечает пользователя как отклонённого.
-  - При сбросе удаляет пользователя, чтобы он мог подать заявку заново.
-- `handle_role_choice(callback, state)` — обрабатывает выбор ролей при одобрении заявки: переключение чек-боксов, пагинацию, выбор всех/никаких, сохранение или отмену.
-- `handle_role_stale(callback)` — fallback для устаревших callback-ов `arole_*`, сообщает об истёкшей сессии.
+  - При одобрении открывает экран выбора ролей, сохраняет состояние `ApprovalState.choosing_roles`.
+  - При отклонении вызывает `user_manager.reject_user(...)` и обновляет сообщение.
+  - При сбросе удаляет пользователя через `_delete_user(...)`, чтобы он мог подать заявку заново.
+- `handle_role_choice(callback: types.CallbackQuery, state: FSMContext) -> None` — обрабатывает выбор ролей при одобрении заявки: переключение чек-боксов, пагинацию, выбор всех/никаких, сохранение или отмену. Сохраняет роли через `user_manager.approve_user(target_user_id, roles=role_names)` и уведомляет пользователя.
+- `handle_role_stale(callback: types.CallbackQuery) -> None` — fallback для устаревших callback-ов `arole_*`, сообщает об истёкшей сессии.
 
 ### Админ-панель `/users`
 
-- `handle_users_forbidden(message)` — отвечает не-env-админам, что `/users` доступна только администраторам из `.env`.
-- `handle_users_command(message, state)` — обрабатывает `/users` и `/users [id|@username]`. Дополнительно проверяет `is_env_admin`.
-- `_show_users_list(state, page, edit, message=None, callback=None)` — отображает постраничный список пользователей.
-- `_render_users_list(users, total, page, total_pages) -> str` — формирует текст списка пользователей.
-- `_build_users_keyboard(users, page, total_pages) -> InlineKeyboardMarkup` — строит клавиатуру списка пользователей.
-- `_open_user_card(state, user_data, edit, message=None, callback=None)` — открывает карточку пользователя.
-- `_render_user_card(u) -> str` — формирует текст карточки пользователя.
-- `_build_user_card_keyboard(u) -> InlineKeyboardMarkup` — строит клавиатуру карточки: изменение ролей, блокировка/разблокировка, удаление, возврат к списку. Для env-админов редактирование запрещено.
-- `_open_role_editor(state, user_data, edit, callback)` — открывает редактор ролей существующего пользователя.
-- `handle_admin_callback(callback, state)` — обрабатывает все `adm_*` callback-и. Доступен только env-админам.
-- `_handle_admin_role_choice(callback, state)` — обрабатывает `adm_role_*`: переключение ролей, пагинацию, сохранение, отмену. Сохраняет роли через `user_manager.set_user_roles(...)`.
-- `_delete_user(user_id)` — удаляет пользователя из `users.yaml` через `user_manager.delete_user(...)`; используется при сбросе статуса заявки.
+- `handle_users_forbidden(message: types.Message) -> None` — отвечает не-env-админам, что `/users` доступна только администраторам из `.env`.
+- `handle_users_command(message: types.Message, state: FSMContext) -> None` — обрабатывает `/users` и `/users [id|@username]`. Дополнительно проверяет `is_env_admin`. Если передан запрос, ищет пользователя через `find_user`, иначе показывает список.
+- `_show_users_list(state: FSMContext, page: int, edit: bool, message: types.Message | None = None, callback: types.CallbackQuery | None = None) -> None` — отображает постраничный список пользователей, устанавливает состояние `AdminState.browsing_users`.
+- `_render_users_list(users: list[dict], total: int, page: int, total_pages: int) -> str` — формирует текст списка пользователей: статус, ФИО, username, количество ролей, номер страницы.
+- `_build_users_keyboard(users: list[dict], page: int, total_pages: int) -> InlineKeyboardMarkup` — строит клавиатуру списка пользователей: кнопки открытия карточки по 2 в ряд и пагинация.
+- `_open_user_card(state: FSMContext, user_data: dict, edit: bool, message: types.Message | None = None, callback: types.CallbackQuery | None = None) -> None` — открывает карточку пользователя, устанавливает состояние `AdminState.viewing_user`.
+- `_render_user_card(u: dict) -> str` — формирует текст карточки пользователя: ФИО, Telegram-имя, username, ID, отдел, цель, статус, роли.
+- `_build_user_card_keyboard(u: dict) -> InlineKeyboardMarkup` — строит клавиатуру карточки: изменение ролей, блокировка/разблокировка, удаление, возврат к списку. Для env-админов редактирование, блокировка и удаление запрещены.
+- `_open_role_editor(state: FSMContext, user_data: dict, edit: bool, callback: types.CallbackQuery) -> None` — открывает редактор ролей существующего пользователя, устанавливает состояние `AdminState.editing_roles`, использует префикс `adm_role_`.
+- `handle_admin_callback(callback: types.CallbackQuery, state: FSMContext) -> None` — обрабатывает все `adm_*` callback-и. Доступен только env-админам. Обрабатывает пагинацию списка, открытие карточки, изменение ролей, блокировку/разблокировку, удаление с подтверждением, редактор ролей.
+- `_handle_admin_role_choice(callback: types.CallbackQuery, state: FSMContext) -> None` — обрабатывает `adm_role_*`: переключение ролей, пагинацию, выбор всех/никаких, сохранение, отмену. Сохраняет роли через `user_manager.set_user_roles(...)` и уведомляет пользователя.
+- `_delete_user(user_id: str) -> None` — удаляет пользователя из `users.yaml` через `user_manager.delete_user(...)`; используется при сбросе статуса заявки.
 
 ### Обработка сообщений
 
-- `handle_non_text(message)` — отвечает на не-текстовые сообщения.
-- `handle_message(message, state)` — основной обработчик текста.
+- `handle_non_text(message: types.Message) -> None` — отвечает на не-текстовые сообщения.
+- `handle_message(message: types.Message, state: FSMContext) -> None` — основной обработчик текста.
   - Для служебных команд из `SERVICE_COMMANDS` пропускает проверку активности пользователя.
-  - Для остальных сообщений проверяет, что пользователь админ или активен; иначе запускает `/start`-подобную обработку.
-  - Формирует `ChatMessage` и вызывает `engine.process_message(msg)`.
+  - Для остальных сообщений проверяет, что пользователь админ или активен; иначе вызывает `handle_start_or_unknown`.
+  - Формирует `ChatMessage(user_id, chat_id, text, status_callback)` и вызывает `engine.process_message(msg)`.
   - Запускает обработку в отдельной `asyncio.Task`, сохраняя её в `session_state.current_task`.
   - Если у пользователя уже есть активная задача — просит дождаться ответа или отправить `/stop`.
-- `_send_long_message(message, text)` — отправляет длинный ответ частями до 4000 символов, стараясь разбивать по переводу строки.
-- `send_message(chat_id: str, text: str) -> None` — публичный метод отправки текста.
-- `send_image(chat_id: str, image_path: str) -> None` — публичный метод отправки изображения.
+  - В фоновой задаче обрабатывает `asyncio.CancelledError`, общие исключения и очищает `current_task` в `finally`.
+- `_send_long_message(message: types.Message, text: str) -> None` — отправляет длинный ответ частями до 4000 символов, стараясь разбивать по переводу строки, с задержкой между частями.
+
+### Публичные методы
+
+- `send_message(chat_id: str, text: str) -> None` — отправляет текст в указанный чат.
+- `send_image(chat_id: str, image_path: str) -> None` — отправляет изображение через `FSInputFile`.
 - `close() -> None` — закрывает сессию бота.
 
 ## Зависимости
@@ -187,3 +202,5 @@
 - Пользовательские данные в HTML-сообщениях экранируются через `html.escape`.
 - Ошибки редактирования сообщений логируются; ошибка `message is not modified` в ряде мест игнорируется.
 - Не-текстовые сообщения получают ответ о том, что бот понимает только текст.
+- env-админы в админ-панели защищены от изменения ролей, блокировки и удаления.
+- `_refresh_admin_commands()` может не установить меню для конкретного админа, если тот ещё не начинал диалог с ботом; ошибка логируется как предупреждение.

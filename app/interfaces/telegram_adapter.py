@@ -1,6 +1,14 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261028.08'
+dv_file_version = '261029.01'
 """Telegram-адаптер на aiogram 3.
+
+Ключевые изменения версии 261029.01:
+- Исходящие ответы движка отправляются с parse_mode="HTML":
+  _send_long_message (через новый хелпер _answer_html) и send_message.
+  Модель по промпту отдаёт <b>/<code>, а не Markdown.
+- При ошибке разметки (TelegramBadRequest: одиночный '<', разорванный
+  при нарезке тег и т.п.) сообщение дублируется без parse_mode — пользователь
+  видит текст, а не сообщение об ошибке в логе.
 
 Ключевые изменения версии 261028.07:
 - /users теперь доступна ТОЛЬКО env-админам (из ADMIN_USERS):
@@ -31,6 +39,7 @@ import os
 
 import yaml
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1424,10 +1433,22 @@ class TelegramAdapter(BaseChatInterface):
     # ------------------------------------------------------------------
     # Отправка длинных сообщений
     # ------------------------------------------------------------------
+    async def _answer_html(self, message: types.Message, text: str) -> None:
+        """Отправляет текст с parse_mode="HTML".
+
+        Если Telegram отверг разметку (одиночный '<', разорванный тег и т.п.),
+        повторяем отправку без parse_mode — пользователь должен получить ответ.
+        """
+        try:
+            await message.answer(text, parse_mode="HTML")
+        except TelegramBadRequest as e:
+            logger.warning("HTML-разметка отклонена Telegram (%s), шлю как текст", e)
+            await message.answer(text, parse_mode=None)
+
     async def _send_long_message(self, message: types.Message, text: str) -> None:
         max_length = 4000
         if len(text) <= max_length:
-            await message.answer(text)
+            await self._answer_html(message, text)
             return
 
         parts: list[str] = []
@@ -1442,7 +1463,7 @@ class TelegramAdapter(BaseChatInterface):
             parts.append(text)
 
         for i, part in enumerate(parts):
-            await message.answer(part)
+            await self._answer_html(message, part)
             if i < len(parts) - 1:
                 await asyncio.sleep(0.3)
 
@@ -1450,7 +1471,15 @@ class TelegramAdapter(BaseChatInterface):
     # Публичные методы (интерфейс BaseChatInterface)
     # ------------------------------------------------------------------
     async def send_message(self, chat_id: str, text: str) -> None:
-        await self.bot.send_message(chat_id=int(chat_id), text=text)
+        try:
+            await self.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode="HTML",
+            )
+        except TelegramBadRequest as e:
+            logger.warning("HTML-разметка отклонена Telegram (%s), шлю как текст", e)
+            await self.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode=None,
+            )
 
     async def send_image(self, chat_id: str, image_path: str) -> None:
         await self.bot.send_photo(

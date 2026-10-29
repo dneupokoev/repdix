@@ -38,6 +38,21 @@ AI-аналитик (Telegram-бот-оркестратор аналитики):
 
 Документация модулей сгруппирована по слоям: точка входа, ядро приложения и интерфейсы мессенджеров.
 
+### Слои и поток обработки
+
+- **Точка входа** загружает `.env`, настраивает логирование, инициализирует сервисы, создаёт движок и выбирает адаптер `cli` или `telegram`.
+- **Адаптер** принимает входящее сообщение и передаёт в ядро нормализованный `ChatMessage`.
+- **Ядро** выполняет маршрутизацию, проверки доступа и безопасности, оркестрирует LLM и запросы к БД, сохраняет историю и аудит, возвращает `ChatResponse`.
+- **Инфраструктурные модули** отвечают за подключения к БД, LLM, кэш, пользователей, RBAC и валидацию SQL.
+
+### Ключевые сквозные механизмы
+
+- **Доступ и безопасность:** пользователи и роли, проверка RBAC по `roles.yaml`, валидация SQL и фильтрация технических сущностей — [user_manager](modules/app/core/user_manager.md), [rbac_guard](modules/app/core/rbac_guard.md), [validator](modules/app/core/validator.md), [technical_filter](modules/app/core/technical_filter.md).
+- **Работа с данными:** пулы подключений к MySQL/PostgreSQL/SQLite, YAML-конфигурация, multi-schema-поддержка и кэш метаданных — [db_manager](modules/app/core/db_manager.md).
+- **LLM-взаимодействие:** загрузка и hot-reload конфигурации моделей, выбор модели, tool-calling и fallback — [llm_client](modules/app/core/llm_client.md).
+- **Состояние и кэш:** in-memory сессии с TTL, блокировки и задача для `/stop`, Redis-кэш с graceful degradation — [session](modules/app/core/session.md), [cache_manager](modules/app/core/cache_manager.md).
+- **Наблюдаемость:** логи `audit.log` и `security.log`, аудит вопросов/ответов и SQL, фиксация нарушений SQL-безопасности — [main](modules/app/main.md), [engine](modules/app/core/engine.md), [validator](modules/app/core/validator.md).
+
 ## Модули проекта
 
 ### Точка входа
@@ -59,5 +74,5 @@ AI-аналитик (Telegram-бот-оркестратор аналитики):
 ### Интерфейсы (`app/interfaces`)
 
 - [base](modules/app/interfaces/base.md) — базовые DTO `ChatMessage`/`ChatResponse` и контракт `BaseChatInterface` с методами `start`, `send_message`, `send_image`.
-- [telegram_adapter](modules/app/interfaces/telegram_adapter.md) — Telegram-адаптер на `aiogram 3`: регистрация через FSM, модерация заявок, админ-панель `/users`, меню команд, маршрутизация в `RepdixEngine`, отправка длинных ответов/изображений, `/stop` и закрытие сессии.
+- [telegram_adapter](modules/app/interfaces/telegram_adapter.md) — Telegram-адаптер на `aiogram 3`: FSM-регистрация, модерация заявок (одобрение/отклонение/сброс), админ-панель `/users` только для env-админов, per-chat меню команд, маршрутизация запросов в `RepdixEngine`, отправка длинных ответов/изображений и уведомлений, `/stop` для отмены анализа и корректное закрытие Telegram-сессии.
 - [cli_adapter](modules/app/interfaces/cli_adapter.md) — консольный адаптер для отладки: ввод из `stdin`, вывод в `stdout`, статусы, служебные команды, отмена текущего запроса по `Ctrl+C` и работа с admin-ролью для RBAC.

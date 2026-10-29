@@ -28,19 +28,19 @@ repdix/
 │   ├── main.py                 # точка входа: логирование, инициализация сервисов, выбор адаптера, graceful shutdown
 │   ├── core/                   # бизнес-логика (независима от мессенджера)
 │   │   ├── __init__.py
-│   │   ├── engine.py           # ядро: Agent Loop, tool_calls, роутинг моделей, RBAC, формирование промпта
+│   │   ├── engine.py           # ядро: Agent Loop, tool_calls, RBAC, формирование промпта (включая правило обрамления идентификаторов MySQL)
 │   │   ├── session.py          # SessionState (история, lock, current_task, last_sqls) + SessionStore с TTL
 │   │   ├── db_manager.py       # пулы соединений (MySQL/PostgreSQL/SQLite), таймауты, read-only, метаданные
 │   │   ├── user_manager.py     # управление доступом (hot-reload users.yaml), add/approve/reject/delete
 │   │   ├── llm_client.py       # клиент LLM (hot-reload models.yaml, temperature из конфига, fallback tools)
 │   │   ├── cache_manager.py    # Redis (история диалогов, graceful degradation)
-│   │   ├── rbac_guard.py       # проверка прав доступа к таблицам и полям (sqlglot AST)
+│   │   ├── rbac_guard.py       # проверка прав доступа к таблицам и полям (sqlglot AST), правила schema.*
 │   │   ├── technical_filter.py # фильтрация технических таблиц/колонок (TECHNICAL_PREFIXES)
 │   │   └── validator.py        # SQL-валидатор (только SELECT/WITH, forbidden keywords, комментарии)
 │   └── interfaces/             # адаптеры мессенджеров
 │       ├── __init__.py
 │       ├── base.py             # ChatMessage (с колбэком статуса), ChatResponse, BaseChatInterface
-│       ├── telegram_adapter.py # Telegram (aiogram), FSM-регистрация, статусы, /stop, модерация
+│       ├── telegram_adapter.py # Telegram (aiogram), FSM-регистрация, HTML-разметка ответов (parse_mode), статусы, /stop, модерация
 │       └── cli_adapter.py      # Консольный интерфейс (отладка, CLI_USER_ID)
 ├── config/
 │   ├── databases.yaml          # шаблоны подключений к целевым БД (${VAR} из .env)
@@ -59,16 +59,17 @@ repdix/
 
 ### 3.1. Ключевые модули
 - `app/main.py` — запуск приложения, инициализация сервисов, выбор адаптера (`telegram` или `cli`), корректное завершение.
-- `app/core/engine.py` — Agent Loop, вызовы инструментов, маршрутизация моделей, проверки RBAC и сборка системного промпта.
+- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC и сборка системного промпта; в промпт добавлено правило обрамления идентификаторов MySQL.
 - `app/core/session.py` — состояние сессии, история, блокировки, активные задачи и TTL-хранилище сессий.
 - `app/core/db_manager.py` — пулы подключений к MySQL/PostgreSQL/SQLite, таймауты, read-only-режим, кэш метаданных и поддержка нескольких схем.
 - `app/core/llm_client.py` — клиент LLM, hot-reload `models.yaml`, fallback-инструменты.
-- `app/core/rbac_guard.py` — контроль доступа к таблицам и полям на основе AST `sqlglot`.
+- `app/core/cache_manager.py` — Redis-кэш истории диалогов, graceful degradation при недоступности Redis.
+- `app/core/rbac_guard.py` — контроль доступа к таблицам и полям на основе AST `sqlglot`, включая правила вида `schema.*`.
 - `app/core/technical_filter.py` — скрытие технических таблиц и колонок по префиксам из `TECHNICAL_PREFIXES`.
 - `app/core/validator.py` — проверка SQL: только `SELECT`/`WITH`, запрещённые ключевые слова, комментарии и multiple statements.
 - `app/core/user_manager.py` — модерация пользователей, hot-reload `users.yaml`, защита администраторов.
 - `app/interfaces/base.py` — абстрактные интерфейсы сообщений и ответов.
-- `app/interfaces/telegram_adapter.py` — Telegram-адаптер: FSM-регистрация, статусы, `/stop`, модерация.
+- `app/interfaces/telegram_adapter.py` — Telegram-адаптер: FSM-регистрация, HTML-разметка ответов (`parse_mode`), статусы, `/stop`, модерация.
 - `app/interfaces/cli_adapter.py` — консольный адаптер для отладки.
 
 ## 🗄️ 4. Работа с базами данных
@@ -90,16 +91,18 @@ repdix/
 В `engine.py` реализован цикл `while step < max_steps` (до 5 шагов). Модель может: изучить структуру таблиц (из системного промпта), выполнить несколько SQL-запросов, сравнить результаты и написать бизнес-вывод.
 **Важно:** В цикле сообщения модели обязательно передаются с ролью `"tool"` и `tool_call_id`, иначе DeepSeek вернёт ошибку 400.
 
+В системный промпт добавлено правило обрамления идентификаторов MySQL обратными кавычками. При формировании простых ответов имена таблиц скрываются от пользователя.
+
 ### 5.2. Chain of Thought (Прозрачность)
 Перед каждым вызовом инструмента модель пишет краткое пояснение.
-**Как это работает:** В `ChatMessage` есть `status_callback`. `telegram_adapter.py` отправляет эти статусы пользователю (вида `🤖 Сейчас посмотрю структуру...`). В `engine.py` текст перехватывается и отправляется через колбэк. Статусы автоматически обрезаются до 80 символов, чтобы не засорять чат. `cli_adapter.py` печатает статусы с отступом.
+**Как это работает:** В `ChatMessage` есть `status_callback`. `telegram_adapter.py` отправляет эти статусы пользователю (вида `🤖 Сейчас посмотрю структуру...`). В `engine.py` текст перехватывается и отправляется через колбэк. Статусы автоматически обрезаются до 80 символов, чтобы не засорять чат. `cli_adapter.py` печатает статусы с отступом. Ответы Telegram отправляются с `parse_mode=HTML`.
 
 ### 5.3. Инструменты модели (Tool Calling)
-Доступны **только три** инструмента:
+Доступны инструменты:
 - `execute_sql` — для сложных аналитических SELECT-запросов.
 - `get_relations` — узнать связи таблиц.
+- `get_table_schema` — получить структуру таблицы с учётом схемы, если данных в системном промпте недостаточно.
 - `execute_template` — выполнить быстрый запрос из `config/templates.yaml` (только MySQL).
-- **⚠️ Важно:** Мы **отказались** от `get_table_schema` (он возвращал гигантский JSON и переполнял контекст). Схема БД (таблицы + поля + связи) уже передаётся в системном промпте через `_get_db_schema()`. **Не возвращайте `get_table_schema` обратно!**
 - **⚠️ Важно:** `SHOW COLUMNS` и `SHOW TABLES` **не пройдут** `validator.validate_sql` — только `SELECT` и `WITH`. Вся нужная информация о структуре уже в промпте.
 
 ### 5.4. Управление историей и прерывание
@@ -206,13 +209,6 @@ models:
     api_key: ${LLM_TOOL_TOKEN}
     supports_tools: true
     temperature: 0.0
-    context_length: 32768
-  deep_analysis_model:
-    model_name: deepseek-v4.1-flash
-    base_url: ${LLM_TOOL_URL}
-    api_key: ${LLM_TOOL_TOKEN}
-    supports_tools: false
-    temperature: 0.2
     context_length: 32768
 ```
 
