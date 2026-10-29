@@ -1,9 +1,9 @@
 # app/interfaces/base.py
-dv_file_version = '261025.01'
+dv_file_version = '261029.05'
 """Базовые интерфейсы и DTO для адаптеров мессенджеров."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Awaitable, Optional
+from typing import Any, Callable, Awaitable, Optional
 
 
 @dataclass
@@ -18,10 +18,16 @@ class ChatMessage:
 
 @dataclass
 class ChatResponse:
-    """Ответ ядра для отправки пользователю."""
+    """Ответ ядра для отправки пользователю.
+
+    reply_markup — необязательная Inline-клавиатура. Ядро не зависит от
+    aiogram и передаёт её «как есть» (dict формата Telegram
+    {"inline_keyboard": [...]}); адаптер сам решает, как её отправить.
+    """
 
     text: str
     image_path: Optional[str] = None
+    reply_markup: Any = None
 
 
 class BaseChatInterface(ABC):

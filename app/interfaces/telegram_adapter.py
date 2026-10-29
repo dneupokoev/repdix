@@ -1,6 +1,47 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261029.02'
+dv_file_version = '261030.02'
 """Telegram-адаптер на aiogram 3.
+
+Ключевые изменения версии 261030.02:
+- handle_memory_callback: явная проверка callback.from_user — если Telegram
+  не передал контекст пользователя, отвечаем ошибкой и не обращаемся к
+  engine. Защита от неполных/поддельных callback'ов.
+- user_id всегда берётся из callback.from_user.id, а не из callback_data:
+  данные кнопки не являются источником идентичности (mem_del_/mem_edit_
+  несут только хэш факта).
+
+Ключевые изменения версии 261029.06:
+- Подписи кнопок памяти синхронизированы с ядром: «❌ N. <текст>» —
+  удалить факт, «✏️ N» — изменить, «➕ Добавить» / «🗑 Очистить всё».
+  Логика обработки callback'ов не менялась: mem_del_/mem_edit_ идут по
+  хэшу текста факта, mem_add/mem_clear — служебные.
+- _send_long_message/_answer_html по-прежнему крепят reply_markup ядра
+  (dict {"inline_keyboard": [...]}) к последней части длинного сообщения.
+
+Ключевые изменения версии 261029.05:
+- Кнопки памяти используют mem_edit_<hash> / mem_del_<hash> (md5[:8] текста
+  факта) вместо индекса: индекс «плывёт» после удаления/добавления.
+- При редактировании в FSM сохраняется сам текст факта (memory_edit_fact)
+  и его хэш (memory_edit_hash), а не порядковый номер.
+- Если факт уже удалён/изменён — пользователь видит «Факт уже удалён или
+  изменён», ничего не портится.
+
+Ключевые изменения версии 261029.04:
+- Интерактивное управление долгосрочной памятью: /memory приходит с
+  Inline-клавиатурой (✏️ Изменить N / ❌ Удалить N / ➕ Добавить /
+  🗑 Очистить всё). Callback'и mem_* обрабатывает handle_memory_callback;
+  новый текст факта вводится в FSM MemoryState.editing / MemoryState.adding.
+- _send_long_message/_answer_html принимают reply_markup из ChatResponse и
+  крепят его к последней части длинного сообщения.
+- _to_markup(): dict из ядра ({"inline_keyboard": [...]}) конвертируется в
+  InlineKeyboardMarkup; некорректная разметка не роняет отправку ответа.
+
+Ключевые изменения версии 261029.03:
+- В SERVICE_COMMANDS добавлены команды долгосрочной памяти:
+  /remember, /memory, /forget, /reset — они не перехватываются
+  регистрационным FSM и уходят в engine.
+- В базовое меню public_commands добавлены BotCommand для этих команд
+  (админы получают их же — admin_commands = public_commands + /users).
 
 Ключевые изменения версии 261029.02:
 - Статусы (send_status внутри handle_message) отправляются с
@@ -37,12 +78,28 @@ dv_file_version = '261029.02'
   (env + YAML с ролью admin). Это by design: модерация — не «админка
   пользователей», а workflow одобрения новых заявок.
 - handle_users_command дополнительно проверяет is_env_admin.
+
+Ключевые изменения версии 261030.01:
+- Добавлен sanitize_telegram_html(): текст ответа LLM экранируется, но
+  безопасные теги Telegram (<b>, <i>, <u>, <s>, <code>, <pre>,
+  <blockquote>, <tg-spoiler>) и <a href="http(s)://…|tg://…"> сохраняются.
+  Всё остальное (<script>, <img>, произвольные атрибуты, javascript:-ссылки)
+  превращается в обычный текст — защита от HTML-инъекций в ответе модели.
+- _answer_html() и send_message() прогоняют текст через санитайзер.
+  _send_long_message() идёт через _answer_html(), значит санитизация
+  применяется к каждой части длинного сообщения.
+- send_status() в handle_message() тоже санитизируется (статус формирует LLM).
+- Полный html.escape() сознательно НЕ применяется: он превратил бы <b> из
+  промпта в &lt;b&gt; и сломал форматирование (регресс версии 261029.02).
+- Если разметка всё же отвергнута Telegram (например, тег разорван нарезкой
+  длинного сообщения), работает прежний fallback — отправка без parse_mode.
 """
 
 import asyncio
 import html
 import logging
 import os
+import re
 
 import yaml
 from aiogram import Bot, Dispatcher, F, types
@@ -65,6 +122,74 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
+# Санитизация HTML из ответов LLM
+# ----------------------------------------------------------------------
+# Теги, которые Telegram parse_mode="HTML" понимает и которые безопасны:
+# не выполняют код и не подгружают внешние ресурсы.
+_SAFE_TAGS = frozenset({
+    "b", "strong", "i", "em", "u", "s", "code", "pre", "blockquote",
+    "tg-spoiler", "a",
+})
+
+# Любой тег: <name ...>, </name>, <name>.
+_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*>")
+
+# Для <a> разрешаем только http(s):// и tg:// — javascript:/data: отсекаются.
+_HREF_RE = re.compile(
+    r"""href\s*=\s*["']((?:https?://|tg://)[^"'<>]*)["']""",
+    re.IGNORECASE,
+)
+
+
+def sanitize_telegram_html(text: str) -> str:
+    """Экранирует HTML, оставляя только безопасные теги Telegram.
+
+    Модель по промпту отвечает с разметкой (<b>, <code> и т.п.), но может
+    сгенерировать и потенциально опасные конструкции (<script>, <img>,
+    произвольные атрибуты, javascript:-ссылки). Такие теги превращаются
+    в обычный текст.
+
+    Args:
+        text: Сырой текст ответа LLM.
+
+    Returns:
+        Текст, безопасный для parse_mode="HTML".
+    """
+    if not text:
+        return ""
+
+    placeholders: list[str] = []
+
+    def _keep(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        name = match.group(1).lower()
+        if name not in _SAFE_TAGS:
+            return raw  # останется в тексте и будет экранирован ниже
+
+        is_closing = raw.startswith("</")
+        if name == "a":
+            if is_closing:
+                normalized = "</a>"
+            else:
+                href = _HREF_RE.search(raw)
+                if href is None:
+                    return raw
+                normalized = f'<a href="{href.group(1)}">'
+        else:
+            normalized = f"</{name}>" if is_closing else f"<{name}>"
+
+        token = f"\x00{len(placeholders)}\x00"
+        placeholders.append(normalized)
+        return token
+
+    masked = _TAG_RE.sub(_keep, text)
+    result = html.escape(masked)
+    for idx, tag in enumerate(placeholders):
+        result = result.replace(f"\x00{idx}\x00", tag)
+    return result
+
+
+# ----------------------------------------------------------------------
 # Константы
 # ----------------------------------------------------------------------
 # Служебные команды, которые НЕ должны перехватываться регистрацией.
@@ -75,6 +200,7 @@ SERVICE_COMMANDS = {
     "/start", "/help", "/stop", "/history", "/compact",
     "/tokens", "/clear", "/settings", "/db", "/model",
     "/models", "/sql",
+    "/remember", "/memory", "/forget", "/reset",
 }
 
 # Сколько ролей показывать на одной странице (3 ряда по 2)
@@ -115,6 +241,13 @@ class AdminState(StatesGroup):
     editing_roles = State()
 
 
+class MemoryState(StatesGroup):
+    """Состояния FSM для редактирования долгосрочной памяти."""
+
+    editing = State()
+    adding = State()
+
+
 class TelegramAdapter(BaseChatInterface):
     """Адаптер Telegram на базе aiogram 3."""
 
@@ -151,6 +284,10 @@ class TelegramAdapter(BaseChatInterface):
             BotCommand(command="tokens", description="Показать расход токенов контекста"),
             BotCommand(command="clear", description="Полностью очистить историю"),
             BotCommand(command="settings", description="Текущие настройки (БД, модель, лимиты)"),
+            BotCommand(command="remember", description="Запомнить факт"),
+            BotCommand(command="memory", description="Показать память"),
+            BotCommand(command="forget", description="Удалить факт"),
+            BotCommand(command="reset", description="Полный сброс"),
         ]
         admin_commands = public_commands + [
             BotCommand(command="users", description="Управление пользователями"),
@@ -228,10 +365,20 @@ class TelegramAdapter(BaseChatInterface):
             F.data.startswith("adm_"),
         )
 
+        # --- Callback: долгосрочная память ---
+        self.dp.callback_query.register(
+            self.handle_memory_callback,
+            F.data.startswith("mem_"),
+        )
+
         # --- FSM-регистрация ---
         self.dp.message.register(self.process_name, RegistrationState.waiting_for_name)
         self.dp.message.register(self.process_department, RegistrationState.waiting_for_department)
         self.dp.message.register(self.process_purpose, RegistrationState.waiting_for_purpose)
+
+        # --- FSM-память (ввод нового / изменённого факта) ---
+        self.dp.message.register(self.process_memory_edit, MemoryState.editing)
+        self.dp.message.register(self.process_memory_add, MemoryState.adding)
 
         # --- Не-текстовые сообщения ---
         self.dp.message.register(self.handle_non_text, ~F.text)
@@ -1373,6 +1520,180 @@ class TelegramAdapter(BaseChatInterface):
             logger.error("Ошибка удаления пользователя %s: %s", user_id, e)
 
     # ------------------------------------------------------------------
+    # Долгосрочная память: Inline-кнопки и FSM-ввод
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _to_markup(markup) -> InlineKeyboardMarkup | None:
+        """Приводит reply_markup из ядра к InlineKeyboardMarkup.
+
+        Ядро не зависит от aiogram и отдаёт dict ({"inline_keyboard": [...]}).
+        Некорректная разметка не должна ломать отправку ответа.
+        """
+        if markup is None:
+            return None
+        if isinstance(markup, InlineKeyboardMarkup):
+            return markup
+        try:
+            return InlineKeyboardMarkup.model_validate(markup)
+        except Exception as e:
+            logger.warning("Некорректная разметка клавиатуры (%s): %r", e, markup)
+            return None
+
+    async def _send_memory_screen(self, message: types.Message, user_id: str) -> None:
+        """Отправляет /memory-экран (текст + кнопки) новым сообщением."""
+        response = await self.engine.render_memory(user_id)
+        await self._answer_html(
+            message, response.text, reply_markup=response.reply_markup,
+        )
+
+    async def _render_memory_message(self, callback: types.CallbackQuery,
+                                      user_id: str) -> None:
+        """Перерисовывает существующее сообщение с памятью."""
+        response = await self.engine.render_memory(user_id)
+        if not callback.message:
+            return
+        markup = self._to_markup(response.reply_markup)
+        try:
+            await callback.message.edit_text(
+                response.text, parse_mode="HTML", reply_markup=markup,
+            )
+        except Exception as e:
+            if "message is not modified" in str(e).lower():
+                return
+            logger.debug("edit_text (memory) не удался (%s), отправляю новое", e)
+            try:
+                await callback.message.answer(
+                    response.text, parse_mode="HTML", reply_markup=markup,
+                )
+            except Exception as e2:
+                logger.error("Не удалось отправить экран памяти: %s", e2)
+
+    async def handle_memory_callback(self, callback: types.CallbackQuery,
+                                      state: FSMContext) -> None:
+        """Обработка кнопок управления долгосрочной памятью (mem_*).
+
+        user_id всегда берётся из callback.from_user.id: callback_data
+        (mem_edit_<hash> / mem_del_<hash>) описывает только целевой факт,
+        но никогда — пользователя. Если Telegram не передал контекст
+        пользователя (редкий, но возможный случай), запрос отклоняется.
+        """
+        if not callback.from_user:
+            await callback.answer(
+                "Ошибка: не удалось определить пользователя.",
+                show_alert=True,
+            )
+            return
+        user_id = str(callback.from_user.id)
+        cbd = callback.data or ""
+
+        if cbd == "mem_add":
+            await state.set_state(MemoryState.adding)
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer(
+                    "✏️ Напишите текст факта, который нужно запомнить.\n"
+                    "Любая команда (например /memory) отменит ввод."
+                )
+            return
+
+        if cbd == "mem_clear":
+            await self.engine.memory_clear(user_id)
+            await state.clear()
+            await self._render_memory_message(callback, user_id)
+            await callback.answer("Память очищена.")
+            return
+
+        if cbd.startswith("mem_edit_"):
+            fact_hash = cbd[len("mem_edit_"):]
+            found = await self.engine.memory_find_by_hash(user_id, fact_hash)
+            if found is None:
+                await callback.answer(
+                    "Факт уже удалён или изменён.", show_alert=True,
+                )
+                return
+            _idx, fact = found
+            # Сохраняем САМ ТЕКСТ факта (и его хэш), а не индекс: к моменту
+            # ввода нового текста список мог измениться.
+            await state.set_state(MemoryState.editing)
+            await state.update_data(
+                memory_edit_hash=fact_hash,
+                memory_edit_fact=fact,
+            )
+            await callback.answer()
+            if callback.message:
+                await callback.message.answer(
+                    "✏️ Введите новый текст факта:\n\n" + fact
+                )
+            return
+
+        if cbd.startswith("mem_del_"):
+            fact_hash = cbd[len("mem_del_"):]
+            ok = await self.engine.memory_delete_by_hash(user_id, fact_hash)
+            if not ok:
+                await callback.answer(
+                    "Факт уже удалён или изменён.", show_alert=True,
+                )
+                return
+            await self._render_memory_message(callback, user_id)
+            await callback.answer("Удалено.")
+            return
+
+        await callback.answer()
+
+    async def process_memory_add(self, message: types.Message, state: FSMContext) -> None:
+        """FSM: пользователь вводит новый факт для памяти."""
+        text = (message.text or "").strip()
+
+        # Команда вместо текста — отменяем ввод и отдаём её обычному роутеру.
+        if text.startswith("/"):
+            await state.clear()
+            await self.handle_message(message, state)
+            return
+
+        if not text:
+            await message.answer("⚠️ Текст факта не может быть пустым.")
+            return
+
+        user_id = str(message.from_user.id)
+        await self.engine.memory_add(user_id, text)
+        await state.clear()
+        await message.answer("🧠 Запомнил.")
+        await self._send_memory_screen(message, user_id)
+
+    async def process_memory_edit(self, message: types.Message, state: FSMContext) -> None:
+        """FSM: пользователь вводит новый текст существующего факта."""
+        text = (message.text or "").strip()
+
+        if text.startswith("/"):
+            await state.clear()
+            await self.handle_message(message, state)
+            return
+
+        data = await state.get_data()
+        fact_hash = data.get("memory_edit_hash")
+        if not isinstance(fact_hash, str) or not fact_hash:
+            await state.clear()
+            await message.answer(
+                "Сессия редактирования истекла. Откройте /memory заново."
+            )
+            return
+
+        if not text:
+            await message.answer("⚠️ Текст факта не может быть пустым.")
+            return
+
+        user_id = str(message.from_user.id)
+        ok = await self.engine.memory_update_by_hash(user_id, fact_hash, text)
+        await state.clear()
+        if not ok:
+            await message.answer(
+                "Факт уже удалён или изменён. Откройте /memory заново."
+            )
+            return
+        await message.answer("✏️ Факт обновлён.")
+        await self._send_memory_screen(message, user_id)
+
+    # ------------------------------------------------------------------
     # Не-текстовые сообщения
     # ------------------------------------------------------------------
     async def handle_non_text(self, message: types.Message) -> None:
@@ -1395,11 +1716,12 @@ class TelegramAdapter(BaseChatInterface):
                 return
 
         async def send_status(status_text: str):
-            # ВАЖНО: html.escape здесь НЕ применяется. status_text формирует
-            # LLM (по промпту — <b>/<code>), экранирование превратило бы
-            # теги в &lt;b&gt; и они показались бы пользователю текстом.
+            # status_text формирует LLM (по промпту — <b>/<code>). Полный
+            # html.escape превратил бы теги в &lt;b&gt;, поэтому применяем
+            # санитайзер: безопасные теги остаются, опасные экранируются.
+            safe_status = sanitize_telegram_html(status_text)
             try:
-                await message.answer(status_text, parse_mode="HTML")
+                await message.answer(safe_status, parse_mode="HTML")
             except Exception as e:
                 # Fallback: некорректная разметка (незакрытый тег, одиночный
                 # '<') — шлём без parse_mode, чтобы бот не упал.
@@ -1424,7 +1746,9 @@ class TelegramAdapter(BaseChatInterface):
         async def run_and_reply():
             try:
                 result: ChatResponse = await self.engine.process_message(msg)
-                await self._send_long_message(message, result.text)
+                await self._send_long_message(
+                    message, result.text, reply_markup=result.reply_markup,
+                )
             except asyncio.CancelledError:
                 try:
                     await message.answer("⛔ Выполнение прервано командой /stop.")
@@ -1451,22 +1775,29 @@ class TelegramAdapter(BaseChatInterface):
     # ------------------------------------------------------------------
     # Отправка длинных сообщений
     # ------------------------------------------------------------------
-    async def _answer_html(self, message: types.Message, text: str) -> None:
-        """Отправляет текст с parse_mode="HTML".
+    async def _answer_html(self, message: types.Message, text: str,
+                            reply_markup=None) -> None:
+        """Отправляет текст с parse_mode="HTML" и (опционально) клавиатурой.
 
-        Если Telegram отверг разметку (одиночный '<', разорванный тег и т.п.),
-        повторяем отправку без parse_mode — пользователь должен получить ответ.
+        Текст ответа LLM прогоняется через sanitize_telegram_html(): опасные
+        теги экранируются, безопасные (<b>, <i>, <code>, <pre>…) остаются.
+        Если Telegram отверг разметку (например, тег разорван нарезкой
+        длинного сообщения), повторяем отправку без parse_mode — пользователь
+        должен получить ответ в любом случае.
         """
+        markup = self._to_markup(reply_markup)
+        safe_text = sanitize_telegram_html(text)
         try:
-            await message.answer(text, parse_mode="HTML")
+            await message.answer(safe_text, parse_mode="HTML", reply_markup=markup)
         except TelegramBadRequest as e:
             logger.warning("HTML-разметка отклонена Telegram (%s), шлю как текст", e)
-            await message.answer(text, parse_mode=None)
+            await message.answer(text, parse_mode=None, reply_markup=markup)
 
-    async def _send_long_message(self, message: types.Message, text: str) -> None:
+    async def _send_long_message(self, message: types.Message, text: str,
+                                  reply_markup=None) -> None:
         max_length = 4000
         if len(text) <= max_length:
-            await self._answer_html(message, text)
+            await self._answer_html(message, text, reply_markup=reply_markup)
             return
 
         parts: list[str] = []
@@ -1481,17 +1812,22 @@ class TelegramAdapter(BaseChatInterface):
             parts.append(text)
 
         for i, part in enumerate(parts):
-            await self._answer_html(message, part)
-            if i < len(parts) - 1:
+            is_last = i == len(parts) - 1
+            await self._answer_html(
+                message, part,
+                reply_markup=reply_markup if is_last else None,
+            )
+            if not is_last:
                 await asyncio.sleep(0.3)
 
     # ------------------------------------------------------------------
     # Публичные методы (интерфейс BaseChatInterface)
     # ------------------------------------------------------------------
     async def send_message(self, chat_id: str, text: str) -> None:
+        safe_text = sanitize_telegram_html(text)
         try:
             await self.bot.send_message(
-                chat_id=int(chat_id), text=text, parse_mode="HTML",
+                chat_id=int(chat_id), text=safe_text, parse_mode="HTML",
             )
         except TelegramBadRequest as e:
             logger.warning("HTML-разметка отклонена Telegram (%s), шлю как текст", e)

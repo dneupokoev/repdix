@@ -1,6 +1,13 @@
 # app/core/cache_manager.py
-dv_file_version = '261028.09'
+dv_file_version = '261030.01'
 """Менеджер кэша на Redis (история диалогов, схема БД).
+
+Ключевые изменения версии 261030.01:
+- __init__ бросает ValueError, если Redis на не-loopback хосте настроен без
+  пароля (защита от случайно открытого в сеть Redis, CVE-2025-21605).
+  Локальные подключения (localhost / 127.0.0.1 / ::1) по-прежнему разрешены
+  без пароля — это штатный сценарий разработки.
+- Пустая строка пароля ("") трактуется так же, как None.
 
 Ключевые изменения версии 261028.09:
 - close() использует aclose() с fallback на close(). В redis-py >= 5.0
@@ -60,7 +67,17 @@ class CacheManager:
             password: Пароль (None или "" = без пароля).
             socket_timeout: Таймаут чтения/записи (сек).
             socket_connect_timeout: Таймаут подключения (сек).
+
+        Raises:
+            ValueError: Redis на не-loopback хосте настроен без пароля.
         """
+        # Fail-fast: открытый в сеть Redis без пароля — известный вектор
+        # компрометации (CVE-2025-21605). Разрешаем только loopback.
+        if not password and host not in ("localhost", "127.0.0.1", "::1"):
+            raise ValueError(
+                "Redis без пароля на удалённом хосте запрещён (CVE-2025-21605)."
+            )
+
         self.client = redis.Redis(
             host=host,
             port=port,

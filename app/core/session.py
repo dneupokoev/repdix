@@ -1,5 +1,5 @@
 # app/core/session.py
-dv_file_version = '261027.05'
+dv_file_version = '261029.01'
 """Состояние сессии пользователя для repdix.
 
 Ключевые изменения версии 261027.05:
@@ -22,6 +22,9 @@ dv_file_version = '261027.05'
 - SessionState.lock создаётся лениво (property), чтобы не тащить asyncio.Lock
   в dataclass default (это работало, но некрасиво: Lock создавался в момент
   конструирования dataclass, что при копировании/сериализации давало сюрпризы).
+- В SessionState добавлены поля summary (краткое резюме старого диалога для
+  auto-compact) и long_term_facts (задел на долговременную память, пока
+  не используется).
 """
 
 import asyncio
@@ -50,6 +53,8 @@ class SessionState:
         lock: asyncio.Lock на пользователя (один запрос за раз).
         current_task: Ссылка на фоновую задачу (для /stop).
         last_sqls: Последние выполненные SQL (для контекста, не в history).
+        summary: Краткое резюме старого диалога (auto-compact).
+        long_term_facts: Задел на долговременную память (пока не используется).
         last_access: time.monotonic() последнего обращения (для TTL).
     """
 
@@ -61,6 +66,8 @@ class SessionState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     current_task: asyncio.Task | None = None
     last_sqls: list[str] = field(default_factory=list)
+    summary: str = ""
+    long_term_facts: list[str] = field(default_factory=list)
     last_access: float = field(default_factory=time.monotonic)
 
 

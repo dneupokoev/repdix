@@ -1,6 +1,13 @@
 # app/core/llm_client.py
-dv_file_version = '261028.08'
+dv_file_version = '261030.01'
 """Клиент для работы с LLM через OpenAI-совместимый API.
+
+Ключевые изменения версии 261030.01:
+- chat(): блок передачи max_tokens сделан строже. Раньше проверка была
+  `if max_tokens:` — значения 0 и "0" молча отбрасывались, а нечисловое
+  значение приводило к неинформативному падению. Теперь: `is not None`,
+  приведение к int, отсев неположительных значений и warning в лог при
+  некорректном значении. Лимит ответа задаётся в config/models.yaml.
 
 Ключевые изменения версии 261028.07:
 - temperature вынесена в конфиг (models.yaml) с дефолтом 0.0. Раньше была
@@ -288,6 +295,9 @@ class LLMClient:
             tool_choice: "auto", "required" или "none".
             response_format: {"type": "json_object"} для JSON-режима.
 
+        Лимит длины ответа берётся из max_tokens в config/models.yaml
+        (для модели) и передаётся в API как kwargs["max_tokens"].
+
         Returns:
             Словарь с ответом модели (model_dump).
         """
@@ -309,13 +319,20 @@ class LLMClient:
             "temperature": temperature,
         }
 
-        # max_tokens (опционально — некоторые локальные модели требуют явно)
+        # max_tokens (опционально). Ограничивает длину ответа — экономия
+        # токенов/денег. Задаётся в config/models.yaml.
         max_tokens = model_conf.get("max_tokens")
-        if max_tokens:
+        if max_tokens is not None:
             try:
-                kwargs["max_tokens"] = int(max_tokens)
+                max_tokens_int = int(max_tokens)
             except (TypeError, ValueError):
-                pass
+                max_tokens_int = 0
+                logger.warning(
+                    "Некорректный max_tokens=%r для модели %s — параметр пропущен",
+                    max_tokens, name,
+                )
+            if max_tokens_int > 0:
+                kwargs["max_tokens"] = max_tokens_int
 
         # tools
         if supports_tools and tools:

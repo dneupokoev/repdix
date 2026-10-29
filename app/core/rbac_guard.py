@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261029.08'
+dv_file_version = '261030.02'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -7,12 +7,18 @@ dv_file_version = '261029.08'
    Короткое имя (без схемы) не матчится, если в правилах есть схема — это
    закрывает обход RBAC через смену схемы (db1.t -> db2.t).
 2. Если в SQL не указана схема, подставляется default_schema (из databases.yaml).
-3. SELECT * запрещён, если у таблицы есть excluded_columns: иначе исключённые
-   поля утекли бы через звёздочку. Требуем явного перечисления полей.
+3. SELECT * разрешён только при allowed_columns == "*" и отсутствии
+   excluded_columns. Если задан явный белый список (allowed_columns) или есть
+   excluded_columns — звёздочка блокируется: иначе не разрешённые/скрытые
+   поля утекли бы. Требуем явного перечисления полей.
 4. sqlglot (диалект mysql) — единственный парсер. Регексп-эвристики убраны:
    они дублировали sqlglot и создавали обходы.
 5. Технические таблицы/колонки (префиксы из TECHNICAL_PREFIXES) блокируются
    до проверки RBAC-правил.
+6. Системные таблицы (information_schema, pg_catalog, sqlite_master)
+   блокируются в любом месте AST (включая подзапросы и UNION) — до
+   применения RBAC-правил. Wildcard "*" (admin) их не открывает.
+7. Парсинг fail-closed: любая ошибка sqlglot — отказ.
 """
 
 import logging
@@ -25,6 +31,14 @@ from sqlglot import exp
 from app.core.technical_filter import is_technical_qualified
 
 logger = logging.getLogger(__name__)
+
+
+# Системные таблицы/схемы: доступ запрещён всегда, даже при wildcard "*".
+SYSTEM_TABLES = (
+    "information_schema",
+    "pg_catalog",
+    "sqlite_master",
+)
 
 
 class RBACGuard:
@@ -278,6 +292,17 @@ class RBACGuard:
             return False, "Пустой SQL-запрос."
 
         # ------------------------------------------------------------------
+        # 0a. Системные таблицы — блокируем в ЛЮБОМ месте AST (подзапросы,
+        #     UNION, CTE). Иначе prompt injection мог бы вытащить метаданные
+        #     БД через information_schema/pg_catalog в обход RBAC (wildcard
+        #     "*" у admin такое пропустил бы).
+        # ------------------------------------------------------------------
+        for table in parsed.find_all(exp.Table):
+            q_name = self._table_qualified_name(table).lower()
+            if any(sys_tbl in q_name for sys_tbl in SYSTEM_TABLES):
+                return False, "Доступ к системным таблицам запрещён."
+
+        # ------------------------------------------------------------------
         # 0. Технические таблицы/колонки — блокируем ДО проверки RBAC.
         #    Иначе правило "*" (admin) открыло бы их.
         # ------------------------------------------------------------------
@@ -406,20 +431,14 @@ class RBACGuard:
             if target_rule is None:
                 # SELECT * — проверим все таблицы запроса
                 for r in table_rule_map.values():
-                    if r["excluded"]:
-                        return (
-                            False,
-                            "SELECT * запрещён: у таблицы есть скрытые поля. "
-                            "Перечислите разрешённые поля явно.",
-                        )
+                    reason = self._star_forbidden_reason(r)
+                    if reason:
+                        return False, reason
                 continue
 
-            if target_rule["excluded"]:
-                return (
-                    False,
-                    "SELECT * запрещён: у таблицы есть скрытые поля. "
-                    "Перечислите разрешённые поля явно.",
-                )
+            reason = self._star_forbidden_reason(target_rule)
+            if reason:
+                return False, reason
 
         # ------------------------------------------------------------------
         # 3. Проверка колонок
@@ -510,6 +529,29 @@ class RBACGuard:
         else:
             schema_name = ""
         return f"{schema_name}.{tbl_name}" if schema_name else tbl_name
+
+    # ------------------------------------------------------------------
+    # Проверка SELECT * по правилу таблицы
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _star_forbidden_reason(rule: dict) -> str | None:
+        """Возвращает причину запрета SELECT * для правила таблицы или None.
+
+        Звёздочка разрешена ТОЛЬКО если allowed_columns == "*" (has_wildcard)
+        и нет excluded_columns. Явный белый список (allowed_columns: [a, b])
+        требует перечисления полей — иначе SELECT * вернул бы поля вне списка.
+        """
+        if rule.get("excluded"):
+            return (
+                "SELECT * запрещён: у таблицы есть скрытые поля. "
+                "Перечислите разрешённые поля явно."
+            )
+        if rule.get("allowed") and not rule.get("has_wildcard"):
+            return (
+                "SELECT * запрещён: таблица имеет явный белый список полей "
+                "(allowed_columns). Перечислите разрешённые поля явно."
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Поиск правила для таблицы

@@ -1,5 +1,5 @@
 # app/core/validator.py
-dv_file_version = '261028.14'
+dv_file_version = '261030.01'
 r"""Валидатор SQL-запросов: проверка безопасности.
 
 Ключевые изменения версии 261028.13:
@@ -45,12 +45,18 @@ r"""Валидатор SQL-запросов: проверка безопасно
 - Добавлен validate_sql_verbose() — возвращает (bool, reason, cleaned_sql)
   для отладки.
 - Публичный API: validate_sql(sql) — совместим со старым.
+- Fail-closed: SQL дополнительно разбирается sqlglot (диалект mysql) ДО
+  регексп-проверок. Любая ошибка разбора — отказ. Это закрывает обходы
+  регекспов через обфускацию (prompt injection, в т.ч. попытки через
+  сломанный синтаксис протащить опасную конструкцию).
 """
 
 import logging
 import os
 import re
 from datetime import datetime
+
+import sqlglot
 
 # Логгер для security-событий (настраивается в main.py._setup_logging)
 _security_logger = logging.getLogger("security")
@@ -148,6 +154,22 @@ def validate_sql(sql: str) -> tuple[bool, str]:
     # Проверка на множественные запросы: любая ; в середине — отказ
     # (после удаления завершающей ;)
     if ";" in cleaned:
+        return False, "multiple statements"
+
+    # Fail-closed: SQL должен успешно разбираться sqlglot. Если парсер
+    # не справился — отклоняем: невалидный/обфусцированный SQL может
+    # обойти регексп-проверки ниже (prompt injection).
+    try:
+        statements = [
+            s for s in sqlglot.parse(cleaned, read="mysql") if s is not None
+        ]
+    except Exception as e:
+        return False, f"sql parse error: {e}"
+
+    if not statements:
+        return False, "empty statement after parsing"
+
+    if len(statements) > 1:
         return False, "multiple statements"
 
     # Для проверки forbidden keywords вырезаем комментарии

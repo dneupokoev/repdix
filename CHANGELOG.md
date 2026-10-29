@@ -24,8 +24,7 @@
 ## [Unreleased]
 
 ### Added
-- feat: добавить в промпт правило обрамления идентификаторов MySQL
-- feat: скрыть имена таблиц в простых ответах, обновить версию
+- feat: добавить авто-сжатие истории и динамическую схему БД
 - feat: добавь HTML-разметку ответов и parse_mode в Telegram
 - feat: добавить поддержку правил вида "schema.*" в RBACGuard
 - feat: добавить поддержку нескольких схем и кэш метаданных БД
@@ -37,15 +36,11 @@
 - feat: чистый релиз repdix (без секретов)
 
 ### Fixed
+- fix: отправлять статусы с HTML-разметкой без обрезки тегов
 - fix: усилить правило вызова get_table_schema перед execute_sql
 
 ### Changed
 - refactor: удалить deep_analysis_model, оставить tool_calling_model
 
 ### Documentation
-- docs(doxdix): finalize SUMMARY.md
-- docs(doxdix): app/interfaces/telegram_adapter.py
-- docs(doxdix): update SUMMARY.md
-- docs(doxdix): update README.md
-- docs(doxdix): update CHANGELOG.md
 - docs: обновить комментарии и регулярное выражение для валидации SQL

@@ -1,3 +1,4 @@
+dv_file_version = '261030.02'
 """Тесты RBAC-гарда (app/core/rbac_guard.py).
 
 Проверяем, что технические таблицы/колонки блокируются ДО применения
@@ -39,6 +40,14 @@ roles:
       users:
         allowed_columns: "*"
         excluded_columns: [secret]
+"""
+
+USERS_WHITELIST_ROLE = """
+roles:
+  test_role:
+    tables:
+      users:
+        allowed_columns: [id, name]
 """
 
 ADMIN_STAR_ROLE = """
@@ -182,7 +191,10 @@ def test_qualified_star_with_technical_columns(tmp_path):
     ok, reason = guard.validate_sql("SELECT u.* FROM users u", ["test_role"], "")
 
     assert ok is False
-    assert "select * forbidden" in reason.lower()
+    reason_lower = reason.lower()
+    assert "select *" in reason_lower and (
+        "forbidden" in reason_lower or "запрещён" in reason_lower
+    )
 
 
 def test_qualified_star_with_excluded_columns(tmp_path):
@@ -193,7 +205,10 @@ def test_qualified_star_with_excluded_columns(tmp_path):
     ok, reason = guard.validate_sql("SELECT u.* FROM users u", ["test_role"], "")
 
     assert ok is False
-    assert "select * forbidden" in reason.lower()
+    reason_lower = reason.lower()
+    assert "select *" in reason_lower and (
+        "forbidden" in reason_lower or "запрещён" in reason_lower
+    )
 
 
 def test_qualified_column_allowed_by_rbac(tmp_path):
@@ -215,3 +230,72 @@ def test_qualified_column_denied_by_rbac(tmp_path):
 
     assert ok is False
     assert "secret" in reason.lower()
+
+
+def test_select_star_blocked_when_allowed_columns_set_but_excluded_empty(tmp_path):
+    """Регрессия: явный белый список (без excluded) не должен пропускать *."""
+    roles_yaml = _write_roles(tmp_path, USERS_WHITELIST_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql("SELECT * FROM users", ["test_role"], "")
+
+    assert ok is False
+    reason_lower = reason.lower()
+    assert "select *" in reason_lower or "запрещён" in reason_lower
+
+
+def test_qualified_select_star_blocked_when_allowed_columns_set(tmp_path):
+    """Алиас-звёздочка (u.*) тоже должна блокироваться при белом списке."""
+    roles_yaml = _write_roles(tmp_path, USERS_WHITELIST_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql(
+        "SELECT u.* FROM users u", ["test_role"], ""
+    )
+
+    assert ok is False
+    reason_lower = reason.lower()
+    assert "select *" in reason_lower or "запрещён" in reason_lower
+
+
+# ----------------------------------------------------------------------
+# Защита от prompt injection, приводящего к опасному SQL:
+#   - системные таблицы запрещены даже для wildcard-правила ("*");
+#   - парсинг fail-closed: битый SQL отклоняется.
+# ----------------------------------------------------------------------
+def test_p2sql_blocks_union_to_system_tables(tmp_path):
+    """Любая роль (даже admin) не должна пробить information_schema."""
+    roles_yaml = _write_roles(tmp_path, ADMIN_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql(
+        "SELECT * FROM information_schema.tables", ["admin"], ""
+    )
+
+    assert ok is False
+    assert "системн" in reason.lower()
+
+
+def test_p2sql_blocks_system_table_in_subquery(tmp_path):
+    """Системная таблица в подзапросе/UNION тоже должна блокироваться."""
+    roles_yaml = _write_roles(tmp_path, ADMIN_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    sql = (
+        "SELECT u.id FROM users u WHERE u.id IN "
+        "(SELECT table_name FROM information_schema.tables)"
+    )
+    ok, reason = guard.validate_sql(sql, ["admin"], "")
+
+    assert ok is False
+    assert "системн" in reason.lower()
+
+
+def test_p2sql_fail_closed_on_parse_error(tmp_path):
+    """Битый SQL не парсится — запрос отклоняется (fail-closed)."""
+    roles_yaml = _write_roles(tmp_path, ADMIN_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql("SELECT (((", ["admin"], "")
+
+    assert ok is False

@@ -1,6 +1,13 @@
 # app/core/db_manager.py
-dv_file_version = '261029.02'
+dv_file_version = '261029.03'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite).
+
+Ключевые изменения версии 261029.03:
+- MySQL: execute_query обёрнут в asyncio.wait_for(timeout=SQL_QUERY_TIMEOUT+2).
+  В режиме readonly=true MAX_EXECUTION_TIME не ставится, поэтому серверный
+  таймаут не работает — теперь клиентский таймаут гарантирует, что бот не
+  зависнет навсегда. При срабатывании выбрасывается TimeoutError с тем же
+  текстом, что и для SQLite.
 
 Ключевые изменения версии 261029.02:
 - Поддержка нескольких схем в одной MySQL-БД: конфиг `schemas` (список или
@@ -409,14 +416,27 @@ class DBManager:
         pool = self.pools[name]
 
         if db_type == 'mysql':
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    if params is not None:
-                        await cur.execute(sql, params)
-                    else:
-                        await cur.execute(sql)
-                    rows = await cur.fetchall()
-                    return rows if rows is not None else []
+            async def _run_mysql_query() -> list[dict]:
+                async with pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        if params is not None:
+                            await cur.execute(sql, params)
+                        else:
+                            await cur.execute(sql)
+                        rows = await cur.fetchall()
+                        return rows if rows is not None else []
+
+            # Серверный таймаут (MAX_EXECUTION_TIME) ставится не всегда:
+            # в режиме readonly=true он не применяется. asyncio.wait_for —
+            # последняя линия защиты от «вечного» запроса.
+            try:
+                return await asyncio.wait_for(
+                    _run_mysql_query(), timeout=self.query_timeout + 2,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(
+                    f"Query timeout exceeded ({self.query_timeout} sec)"
+                )
 
         elif db_type == 'postgresql':
             async with pool.acquire() as conn:

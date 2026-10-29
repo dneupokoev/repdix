@@ -8,8 +8,12 @@ databases:
     database: ${DB_MAIN_NAME}
     schemas: auto
     exclude_schemas: [mysql, information_schema, performance_schema, sys]
-    readonly: true
     description: "Основная БД"
+    readonly: true
+    is_mariadb: false       # true, если СУБД — MariaDB (отключает MAX_EXECUTION_TIME)
+    charset: utf8mb4
+    minsize: 1
+    maxsize: 5
 
   pg_local:
     type: postgresql
@@ -18,9 +22,17 @@ databases:
     user: postgres
     password: ${PG_LOCAL_PASSWORD}
     database: postgres
+    description: "Локальная PostgreSQL для тестов"
     readonly: true
+    schemas: [public]
+    min_size: 1
+    max_size: 5
 
   sqlite_local:
     type: sqlite
     path: data/test.db
-    # readonly не поддерживается драйвером aiosqlite; защита — только валидатор SQL
+    description: "Локальная SQLite для тестов"
+    readonly: true
+    # Внимание: драйвер aiosqlite не поддерживает readonly на уровне СУБД.
+    # Защита: PRAGMA query_only = ON (выставляется в db_manager при readonly: true)
+    # и валидатор SQL.

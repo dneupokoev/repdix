@@ -1,6 +1,71 @@
 # app/core/engine.py
-dv_file_version = '261029.15'
+dv_file_version = '261029.23'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
+
+Ключевые изменения версии 261029.23:
+- Удалён инструмент execute_template: он работал только для MySQL и создавал
+  путаницу (модель пыталась использовать шаблоны на других диалектах).
+  Убрано из TOOLS_DEFINITION, из цикла tool_calls в process_message (вместе
+  с «белым списком» инструментов) и из системного промпта. Метод
+  _run_yaml_template удалён. config/templates.yaml оставлен на будущее, но
+  больше не используется.
+
+Ключевые изменения версии 261029.22:
+- Подпись кнопки удаления содержит сам текст факта: «❌ N. <текст>»
+  (текст схлопывается в одну строку и обрезается до 30 символов).
+  callback_data по-прежнему mem_del_<md5[:8]> — привязка к содержимому,
+  а не к индексу.
+- Кнопка изменения стала компактной «✏️ N» (mem_edit_<md5[:8]>).
+- Добавлен хелпер _memory_button_label() — единая подготовка подписи
+  факта для кнопок (защита от лимита Telegram в 64 символа на кнопку).
+
+Ключевые изменения версии 261029.21:
+- Callback'и памяти привязаны к содержимому факта, а не к индексу:
+  mem_edit_<hash> / mem_del_<hash>, где hash — первые 8 символов md5
+  текста факта. Индекс «плыл» после удаления/добавления, и кнопка
+  могла изменить не тот факт.
+- memory_find_by_hash / memory_delete_by_hash / memory_update_by_hash:
+  операции по хэшу; если факт уже удалён/изменён — возвращают None/False,
+  адаптер отвечает «Факт уже удалён или изменён».
+
+Ключевые изменения версии 261029.20:
+- Долгосрочная память стала интерактивной: /memory возвращает ChatResponse
+  с reply_markup (dict {"inline_keyboard": [...]}) — кнопки на каждый факт
+  (✏️ Изменить N, ❌ Удалить N) и общие (➕ Добавить, 🗑 Очистить всё).
+- Публичные методы render_memory / memory_add / memory_update / memory_delete /
+  memory_clear / memory_get — единая точка изменения памяти для адаптеров
+  (адаптер не лезет в SessionState напрямую).
+- _load_memory: факты подгружаются из Redis при первом обращении, поэтому
+  кнопки работают и в callback-хэндлерах (без вызова process_message).
+
+Ключевые изменения версии 261029.19:
+- _build_base_prompt: в "ПРАВИЛА АНАЛИЗА" добавлен пункт об обязательном
+  учёте долгосрочной памяти как постоянного фильтра SQL.
+- Статусы (status_callback) очищаются от HTML-тегов: Telegram не принимает
+  произвольные теги ("Unsupported start tag"), статусы всегда plain text.
+
+Ключевые изменения версии 261029.18:
+- Долгосрочная память пользователя: state.long_term_facts загружается из
+  Redis (repdix:memory:{user_id}, TTL 30 дней) и добавляется в системный
+  промпт блоком "Долгосрочная память пользователя".
+- Новые команды: /remember <текст>, /memory, /forget <номер>, /reset
+  (история + память + last_sqls). /clear очищает только историю —
+  память сохраняется.
+- Хелпер _save_memory() — единая точка записи памяти в Redis.
+
+Ключевые изменения версии 261029.16:
+- Динамическая схема БД: _get_db_schema(state, user_query) выводит поля
+  только для таблиц, упомянутых в вопросе / последних 4 сообщениях истории /
+  последних SQL. Если совпадений нет — в промпт идёт только список имён
+  таблиц (экономия контекста). Русские смысловые подсказки: "центр" -> centers,
+  "выручка" -> revenue и т.п.
+- Auto-Compact: при >60% лимита контекста первые 4 сообщения истории
+  сжимаются LLM в 2 предложения и заменяются одним system-сообщением.
+  Резюме дублируется в state.summary и сохраняется в Redis вместе с историей
+  (формат {"history": [...], "summary": "..."}; старый формат со списком
+  поддерживается при чтении).
+- В системный промпт добавлен блок "Последние выполненные SQL" (3 шт.):
+  модель может переиспользовать запрос для другого периода.
 
 Ключевые изменения версии 261029.15:
 - Статусы (status_callback) отдаются с HTML-разметкой модели: убрана обрезка
@@ -86,6 +151,8 @@ dv_file_version = '261029.15'
 """
 
 import asyncio
+import hashlib
+import html
 import json
 import logging
 import os
@@ -111,6 +178,14 @@ audit_logger = logging.getLogger("audit")
 TIME_MARKERS = ["когда", "дата", "время", "последние", "последняя", "свежие", "newest", "latest"]
 
 STRUCTURE_MARKERS = ["описание", "поля", "структура", "метаданные"]
+
+# Служебные токены, которые не должны считаться упоминанием таблицы
+# (иначе "покажи data" подтянет случайную таблицу с таким фрагментом).
+_TABLE_TOKEN_STOPWORDS = {
+    "data", "table", "tables", "show", "select", "from", "where", "with",
+    "this", "that", "what", "when", "last", "latest", "json", "text",
+    "the", "and", "for", "not", "all", "any", "new", "old", "top", "count",
+}
 
 
 # ----------------------------------------------------------------------
@@ -143,35 +218,6 @@ TOOLS_DEFINITION: list[dict] = [
                 "type": "object",
                 "properties": {"table_name": {"type": "string", "description": "Имя таблицы"}},
                 "required": ["table_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_template",
-            "description": (
-                "Выполнить предопределенный шаблонный запрос. Используй для типовых "
-                "вопросов (кто работал, топ-N, лучшие, рейтинги), чтобы сэкономить "
-                "время и избежать ошибок."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "template_name": {
-                        "type": "string",
-                        "description": "Имя шаблона (например, who_worked или top_n_edits)",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Количество строк для рейтинга (если применимо, например 8)",
-                    },
-                    "period": {
-                        "type": "string",
-                        "description": "Период (сегодня, вчера, этот месяц, или конкретная дата YYYY-MM-DD)",
-                    },
-                },
-                "required": ["template_name"],
             },
         },
     },
@@ -242,9 +288,7 @@ def _build_base_prompt(
         "нагрузка, кто виноват в простое).\n"
         "У тебя есть доступ к базе данных через инструменты:\n"
         "1. execute_sql — выполнить любой SELECT-запрос.\n"
-        "2. get_relations — узнать связи таблиц.\n"
-        "3. execute_template — выполнить предопределённый шаблонный запрос "
-        "(топ-N, кто работал, рейтинги).\n\n"
+        "2. get_relations — узнать связи таблиц.\n\n"
         "ПРАВИЛА АНАЛИЗА:\n"
         "- Если пользователь задаёт сложный вопрос ('почему упали продажи?', 'в чём причина?', "
         "'сравни'), ты ДОЛЖЕН выполнить НЕСКОЛЬКО SQL-запросов подряд, чтобы собрать данные.\n"
@@ -266,7 +310,12 @@ def _build_base_prompt(
         "НЕ пиши имена таблиц и полей — просто выдавай результат. Пользователю "
         "нужны данные, а не SQL-схема.\n"
         "- ЕСЛИ ДАННЫЕ УСТАРЕЛИ — сообщи об этом. Например: 'последняя сборка 22.09, новых "
-        "данных 5 недель нет'. Это важнее абсолютных цифр.\n\n"
+        "данных 5 недель нет'. Это важнее абсолютных цифр.\n"
+        "- УЧИТЫВАЙ ДОЛГОСРОЧНУЮ ПАМЯТЬ. Если в блоке 'Долгосрочная память пользователя' "
+        "есть факт, ограничивающий область (например, 'работаю только с центром X', "
+        "'игнорируй технические звонки'), ты ОБЯЗАН применить его как фильтр в SQL "
+        "(WHERE center_name = 'X'), даже если пользователь не повторил это в текущем "
+        "вопросе. Память — это постоянное условие, а не просто контекст.\n\n"
         "ПРАВИЛА SQL:\n"
         "- ПРАВИЛО ИДЕНТИФИКАТОРОВ (MySQL): ВСЕГДА оборачивай имена таблиц, колонок и "
         "алиасов в обратные кавычки (`). Например: SELECT `center_name`, "
@@ -338,6 +387,27 @@ class RepdixEngine:
         self.show_model_in_response = os.environ.get("SHOW_MODEL_IN_RESPONSE", "false").lower() == "true"
         self.max_rows_in_response = int(os.environ.get("MAX_ROWS_IN_RESPONSE") or "100")
         self.max_message_length = int(os.environ.get("MAX_MESSAGE_LENGTH") or "4000")
+
+    # ---------- Динамическая схема: настройки ----------
+    # Сколько последних сообщений истории учитывать при поиске таблиц
+    _SCHEMA_HISTORY_MESSAGES = 4
+
+    # Смысловые подсказки: корень из запроса -> фрагменты имён таблиц
+    _TABLE_KEYWORD_HINTS: dict[str, tuple[str, ...]] = {
+        "центр": ("center", "centers"),
+        "выручк": ("revenue", "appointment", "sales"),
+        "продаж": ("sale", "sales", "revenue"),
+        "запис": ("appointment", "appointments", "booking"),
+        "приём": ("appointment", "appointments"),
+        "прием": ("appointment", "appointments"),
+        "диалог": ("dialog", "dialogs", "queue", "c2t"),
+        "оператор": ("operator", "operators", "reviewer"),
+        "судья": ("judge", "to_judge"),
+        "очеред": ("queue",),
+        "сборк": ("dataset",),
+        "рейтинг": ("rating", "top"),
+        "отзыв": ("review", "reviews"),
+    }
 
     # ---------- Хелперы ----------
     def _get_default_schema(self, state: SessionState) -> str:
@@ -551,120 +621,6 @@ class RepdixEngine:
                 continue
         return None
 
-    # ---------- Выполнение YAML-шаблона ----------
-    async def _run_yaml_template(self, tpl_name: str, limit: int | None,
-                                  period: str | None, state: SessionState) -> str:
-        """Выполняет шаблон из config/templates.yaml.
-
-        ВАЖНО: собранный SQL прогоняется через RBAC-гард — иначе шаблон мог бы
-        обратиться к таблице, недоступной пользователю (это была дыра).
-        """
-        if state.current_db is None or self.db_manager is None:
-            return "БД не выбрана."
-
-        db_type = self._get_db_type(state)
-        if db_type != "mysql":
-            return f"Шаблоны доступны только для MySQL (текущая БД: {db_type})."
-
-        try:
-            with open("config/templates.yaml", "r", encoding="utf-8") as f:
-                templates = yaml.safe_load(f) or []
-        except Exception as e:
-            return f"Ошибка загрузки шаблонов: {e}"
-
-        tpl = next((t for t in templates if t.get("name") == tpl_name), None)
-        if not tpl:
-            return f"Шаблон '{tpl_name}' не найден."
-
-        # Технические таблицы недоступны даже через шаблоны (иначе admin
-        # через execute_template увидел бы скрытые данные в обход RBAC).
-        tpl_table_raw = str(tpl.get("table") or "")
-        if is_technical(tpl_table_raw):
-            logger.warning(
-                "Шаблон '%s' ссылается на техническую таблицу '%s' — отказ.",
-                tpl_name, tpl_table_raw,
-            )
-            return "Шаблон ссылается на техническую таблицу и недоступен."
-
-        # Валидация имён полей/таблиц из шаблона (защита от инъекции через конфиг)
-        def _safe_ident(x: str | None, default: str) -> str:
-            if not x or not re.fullmatch(r"[a-zA-Z0-9_\.]+", x):
-                return default
-            return x
-
-        group_by_field = _safe_ident(tpl.get("group_by_field"), "reviewer")
-        table = _safe_ident(tpl.get("table"), "c2t_asr_training_review")
-        time_field = _safe_ident(tpl.get("time_field"), "created_at")
-        action_field = tpl.get("action_field")
-        if action_field is not None:
-            action_field = _safe_ident(action_field, "")
-        action_value = tpl.get("action_value")
-
-        final_limit = limit or tpl.get("limit")
-        try:
-            final_limit = int(final_limit) if final_limit else None
-        except (TypeError, ValueError):
-            final_limit = None
-
-        where_clause = "1=1"
-        if period:
-            period_lower = period.lower()
-            if period_lower == "сегодня":
-                where_clause = f"{time_field} >= CURDATE()"
-            elif period_lower == "вчера":
-                where_clause = f"{time_field} >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND {time_field} < CURDATE()"
-            elif period_lower == "этот месяц":
-                where_clause = f"{time_field} >= DATE_FORMAT(CURDATE(), '%Y-%m-01')"
-            elif period_lower == "этот год":
-                where_clause = f"{time_field} >= DATE_FORMAT(CURDATE(), '%Y-01-01')"
-            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", period):
-                where_clause = f"{time_field} >= '{period} 00:00:00'"
-            else:
-                year_match = re.search(r'\d{4}', period)
-                if year_match:
-                    year = year_match.group(0)
-                    where_clause = f"{time_field} >= '{year}-01-01'"
-
-        if action_field and action_value is not None:
-            # action_value — строка, экранируем кавычки
-            safe_value = str(action_value).replace("'", "''")
-            where_clause += f" AND {action_field} = '{safe_value}'"
-
-        sql = (
-            f"SELECT {group_by_field}, COUNT(*) AS cnt FROM {table} "
-            f"WHERE {where_clause} GROUP BY {group_by_field} ORDER BY cnt DESC"
-        )
-        if final_limit:
-            sql += f" LIMIT {final_limit}"
-
-        # --- RBAC-проверка (закрываем дыру) ---
-        # Проверка выполняется ВСЕГДА (как в /sql и execute_sql): админ
-        # обходит только обычные RBAC-правила, но не технический фильтр.
-        if self.user_manager:
-            user_roles = self.user_manager.get_user_roles(state.user_id) or []
-            default_schema = self._get_default_schema(state)
-            rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
-            technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
-            if not rbac_ok and ("admin" in user_roles) and not technical_denied:
-                logger.info("template: admin bypass for non-technical SQL")
-            elif not rbac_ok:
-                log_violation(state.user_id, sql, f"RBAC(template): {rbac_msg}")
-                return f"⛔ Доступ запрещён: {rbac_msg}"
-
-        try:
-            rows = await self.db_manager.execute_query(state.current_db, sql)
-            if not rows:
-                return "За указанный период нет данных."
-
-            lines = ["Результаты:"]
-            for i, row in enumerate(rows, 1):
-                name = row.get(group_by_field) or "—"
-                count = row.get("cnt", 0)
-                lines.append(f"{i}. {name}: {count}")
-            return "\n".join(lines)
-        except Exception as e:
-            return f"Ошибка выполнения SQL: {e}"
-
     # ---------- Связи таблиц (текстом) ----------
     def _get_relations_text(self, allowed_tables: list[str] | None = None) -> str:
         """Загружает связи из config/relations.yaml.
@@ -722,13 +678,18 @@ class RepdixEngine:
         return "\n".join(lines)
 
     # ---------- Схема БД (RAG) ----------
-    async def _get_db_schema(self, state: SessionState) -> str:
+    async def _get_db_schema(self, state: SessionState, user_query: str = "") -> str:
         """Формирует схему БД ТОЛЬКО из разрешённых схем, таблиц и полей.
 
         Multi-schema: таблицы выводятся как fully-qualified (schema.table).
         Схемы фильтруются через rbac.get_allowed_schemas(), таблицы — через
         rbac.get_allowed_tables(). Для admin разрешены все схемы из
         db_manager.get_schemas().
+
+        Динамическая фильтрация: поля выводятся только для таблиц, релевантных
+        запросу (user_query), последним 4 сообщениям истории и последним SQL.
+        Если ничего не найдено — отдаём только список имён таблиц, чтобы
+        не жечь контекст.
         """
         if state.current_db is None or self.db_manager is None:
             return ""
@@ -792,26 +753,134 @@ class RepdixEngine:
         if not target:
             return "В RBAC разрешены таблицы, но в БД их нет."
 
-        # 4) Текст для промпта
+        # 4) Динамическая фильтрация: обычно нужны 1–2 таблицы из десятков.
+        # Без неё схема с полями всех таблиц съедала большую часть контекста.
+        target, matched = self._filter_target_tables(target, state, user_query)
+
+        # 5) Текст для промпта
         schemas_str = ", ".join(sorted(allowed_schemas)) or "—"
         lines = [
             f"Доступные схемы: {schemas_str}. "
             f"Схема по умолчанию: {default_schema or '—'}."
         ]
 
-        for sch, tbl, table_rules in target:
-            lines.extend(
-                await self._describe_table(state, sch, tbl, table_rules, all_tables)
-            )
+        if matched:
+            for sch, tbl, table_rules in target:
+                lines.extend(
+                    await self._describe_table(state, sch, tbl, table_rules, all_tables)
+                )
 
-        relations_text = self._get_relations_text(
-            allowed_tables=[f"{s}.{t}" for s, t, _ in target]
-        )
-        if relations_text:
+            relations_text = self._get_relations_text(
+                allowed_tables=[f"{s}.{t}" for s, t, _ in target]
+            )
+            if relations_text:
+                lines.append("")
+                lines.append(relations_text)
+        else:
+            # Ничего не угадали — только имена таблиц (без полей).
+            # Модель сама вызовет execute_sql / get_relations, если нужны детали.
             lines.append("")
-            lines.append(relations_text)
+            lines.append(
+                "Таблицы в доступе (поля не показаны — уточните запрос "
+                "или используйте execute_sql / get_relations):"
+            )
+            for sch, tbl, _rules in target:
+                full_name = f"{sch}.{tbl}" if sch else tbl
+                lines.append(f"  - {full_name}")
 
         return "\n".join(lines)
+
+    def _recent_history_text(self, state: SessionState) -> str:
+        """Текст последних сообщений истории (для поиска упоминаний таблиц)."""
+        limit = self._SCHEMA_HISTORY_MESSAGES
+        parts = [str(m.get("content", "")) for m in state.history[-limit:]]
+        return " ".join(parts).lower()
+
+    @staticmethod
+    def _text_mentions_table(text_lower: str, table: str) -> bool:
+        """Проверяет, упоминается ли таблица в тексте (полностью или частями).
+
+        Примеры: "pbi_centers" в "покажи pbi_centers_monthly",
+        "centers" в "топ по centers".
+        """
+        if not text_lower or not table:
+            return False
+        t = table.lower()
+        tokens = set(re.findall(r"[a-z0-9_]{3,}", text_lower))
+        if not tokens:
+            return False
+        if t in tokens:
+            return True
+
+        # Части составного имени: pbi_centers_monthly -> centers, monthly
+        for seg in t.split("_"):
+            if len(seg) >= 3 and seg in tokens:
+                return True
+
+        # Пользователь написал только часть имени таблицы.
+        for token in tokens:
+            if token in _TABLE_TOKEN_STOPWORDS:
+                continue
+            if len(token) >= 4 and token in t:
+                return True
+        return False
+
+    def _filter_target_tables(
+        self,
+        target: list[tuple[str, str, dict | None]],
+        state: SessionState,
+        user_query: str,
+    ) -> tuple[list[tuple[str, str, dict | None]], bool]:
+        """Оставляет в схеме только таблицы, релевантные вопросу.
+
+        Returns:
+            (таблицы, matched). matched=True — найдены конкретные таблицы,
+            для них нужно вывести поля. matched=False — ничего не угадали,
+            в промпт пойдёт только список имён (экономия токенов).
+        """
+        if not target:
+            return [], False
+
+        query = (user_query or "").lower()
+        history_text = self._recent_history_text(state)
+        last_sql_text = " ".join(state.last_sqls[-3:]).lower()
+        haystack = " ".join((query, history_text, last_sql_text)).strip()
+
+        matched: list[tuple[str, str, dict | None]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def _add(item: tuple[str, str, dict | None]) -> None:
+            key = (item[0].lower(), item[1].lower())
+            if key not in seen:
+                seen.add(key)
+                matched.append(item)
+
+        # 1) Прямые упоминания имён таблиц (вопрос, история, последние SQL)
+        for item in target:
+            tbl = item[1]
+            if (
+                self._text_mentions_table(query, tbl)
+                or self._text_mentions_table(history_text, tbl)
+                or self._text_mentions_table(last_sql_text, tbl)
+            ):
+                _add(item)
+
+        # 2) Смысловые подсказки: "центр" -> centers, "выручка" -> revenue
+        if not matched:
+            needles: set[str] = set()
+            for stem, hints in self._TABLE_KEYWORD_HINTS.items():
+                if stem in haystack:
+                    needles.update(hints)
+            if needles:
+                for item in target:
+                    tbl = item[1].lower()
+                    if any(n in tbl for n in needles):
+                        _add(item)
+
+        if not matched:
+            # Возвращаем полный список — вызывающий выведет только имена.
+            return target, False
+        return matched, True
 
     async def _describe_table(self, state: SessionState, schema: str, table: str,
                                rules: dict | None,
@@ -874,6 +943,56 @@ class RepdixEngine:
 
         return result
 
+    # ---------- Auto-compact ----------
+    async def _compact_history(self, state: SessionState, model_name: str,
+                                messages: list[dict]) -> str | None:
+        """Сжимает первые сообщения истории в короткое резюме (auto-compact).
+
+        Args:
+            state: Состояние сессии (для логов).
+            model_name: Модель для сжатия.
+            messages: Сообщения, которые нужно сжать.
+
+        Returns:
+            Текст резюме или None при ошибке/пустом ответе. При None история
+            остаётся нетронутой (лучше переполнение, чем потеря контекста).
+        """
+        if self.llm_client is None or not messages:
+            return None
+
+        try:
+            payload = json.dumps(messages, ensure_ascii=False)
+        except (TypeError, ValueError):
+            payload = str(messages)
+
+        try:
+            response = await self.llm_client.chat(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Сожми этот диалог в 2 предложения. Сохрани все цифры, "
+                            "имена таблиц и условия фильтрации. Без вступлений и воды."
+                        ),
+                    },
+                    {"role": "user", "content": payload},
+                ],
+                tools=None,
+                model_name=model_name,
+            )
+            summary = (response["choices"][0]["message"].get("content") or "").strip()
+        except Exception as e:
+            logger.warning(
+                "Auto-compact: не удалось сжать историю для %s: %s",
+                getattr(state, "user_id", "?"), e,
+            )
+            return None
+
+        if not summary:
+            return None
+        # Резюме само не должно съедать контекст
+        return summary[:1000]
+
     # ---------- Главный обработчик ----------
     async def process_message(self, msg: ChatMessage) -> ChatResponse:
         user_id = msg.user_id
@@ -910,19 +1029,42 @@ class RepdixEngine:
                 cached = await self.cache_manager.get(cache_key)
                 if cached:
                     try:
-                        state.history = json.loads(cached)
+                        payload = json.loads(cached)
                     except json.JSONDecodeError:
+                        payload = None
+                    if isinstance(payload, dict):
+                        # Новый формат: {"history": [...], "summary": "..."}
+                        state.history = payload.get("history") or []
+                        state.summary = payload.get("summary") or ""
+                    elif isinstance(payload, list):
+                        # Совместимость со старым форматом (только история)
+                        state.history = payload
+                    else:
                         state.history = []
                 else:
                     state.history = []
+
+                # Долгосрочная память (repdix:memory:{user_id}, TTL 30 дней).
+                # Не обнуляем список, если ключа нет: факты, добавленные в этой
+                # сессии через /remember, должны остаться в памяти процесса.
+                mem_key = f"repdix:memory:{user_id}"
+                mem_raw = await self.cache_manager.get(mem_key)
+                if mem_raw:
+                    try:
+                        loaded_facts = json.loads(mem_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        loaded_facts = None
+                    if isinstance(loaded_facts, list):
+                        state.long_term_facts = [str(f) for f in loaded_facts]
 
             # ---------- /clear ----------
             if text == "/clear":
                 state.last_model_used = "algorithm (command)"
                 state.history = []
+                state.summary = ""
                 if self.cache_manager is not None:
                     await self.cache_manager.delete(f"repdix:history:{user_id}")
-                audit_answer = "История диалога очищена."
+                audit_answer = "История очищена. Долгосрочная память сохранена."
                 if self.show_model_in_response:
                     audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                 self._log_audit(state, msg, audit_question, audit_answer)
@@ -993,11 +1135,15 @@ class RepdixEngine:
                     ]
                     response = await self.llm_client.chat(messages, model_name=state.current_model)
                     summary = response["choices"][0]["message"]["content"]
+                    state.summary = summary
                     state.history = [{"role": "system", "content": f"Резюме предыдущего диалога: {summary}"}]
                     if self.cache_manager is not None:
                         await self.cache_manager.set(
                             f"repdix:history:{user_id}",
-                            json.dumps(state.history, ensure_ascii=False),
+                            json.dumps(
+                                {"history": state.history, "summary": state.summary},
+                                ensure_ascii=False,
+                            ),
                             ttl=86400,
                         )
                     audit_answer = f"История сжата. Новый размер: {len(state.history)} сообщений. Резюме: {summary[:300]}..."
@@ -1081,6 +1227,77 @@ class RepdixEngine:
                 lines.append(f"Таймаут SQL: {timeout_val} сек.")
 
                 audit_answer = "\n".join(lines)
+                if self.show_model_in_response:
+                    audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                self._log_audit(state, msg, audit_question, audit_answer)
+                return ChatResponse(text=audit_answer)
+
+            # ---------- /remember <текст> ----------
+            if text == "/remember" or text.startswith("/remember "):
+                state.last_model_used = "algorithm (command)"
+                fact = text[len("/remember"):].strip()
+                if not fact:
+                    audit_answer = (
+                        "Напишите, что запомнить (например: "
+                        "/remember я работаю с центром 15_Типанова)"
+                    )
+                else:
+                    state.long_term_facts.append(fact)
+                    await self._save_memory(user_id, state.long_term_facts)
+                    audit_answer = f"🧠 Запомнил: {fact}"
+                if self.show_model_in_response:
+                    audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                self._log_audit(state, msg, audit_question, audit_answer)
+                return ChatResponse(text=audit_answer)
+
+            # ---------- /memory ----------
+            if text == "/memory":
+                state.last_model_used = "algorithm (command)"
+                memory_response = await self.render_memory(user_id, state=state)
+                audit_answer = memory_response.text
+                if self.show_model_in_response:
+                    audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                self._log_audit(state, msg, audit_question, audit_answer)
+                return ChatResponse(
+                    text=audit_answer,
+                    reply_markup=memory_response.reply_markup,
+                )
+
+            # ---------- /forget <номер> ----------
+            if text == "/forget" or text.startswith("/forget "):
+                state.last_model_used = "algorithm (command)"
+                arg = text[len("/forget"):].strip()
+                idx: int | None = None
+                if arg.isdigit():
+                    num = int(arg)
+                    if 1 <= num <= len(state.long_term_facts):
+                        idx = num - 1
+                if idx is None:
+                    audit_answer = "Факт с таким номером не найден."
+                else:
+                    state.long_term_facts.pop(idx)
+                    await self._save_memory(user_id, state.long_term_facts)
+                    audit_answer = (
+                        f"🗑 Факт удалён. Осталось: {len(state.long_term_facts)}."
+                    )
+                if self.show_model_in_response:
+                    audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                self._log_audit(state, msg, audit_question, audit_answer)
+                return ChatResponse(text=audit_answer)
+
+            # ---------- /reset (история + память + last_sqls) ----------
+            if text == "/reset":
+                state.last_model_used = "algorithm (command)"
+                state.history = []
+                state.summary = ""
+                state.long_term_facts = []
+                state.last_sqls = []
+                if self.cache_manager is not None:
+                    await self.cache_manager.delete(f"repdix:history:{user_id}")
+                    await self.cache_manager.delete(f"repdix:memory:{user_id}")
+                audit_answer = (
+                    "🔄 Всё сброшено: история и долгосрочная память очищены."
+                )
                 if self.show_model_in_response:
                     audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                 self._log_audit(state, msg, audit_question, audit_answer)
@@ -1318,14 +1535,38 @@ class RepdixEngine:
                 base_prompt = _build_base_prompt(
                     db_type, prompt_schemas, prompt_default_schema,
                 )
-                schema = await self._get_db_schema(state)
+                schema = await self._get_db_schema(state, msg.text)
+
+                # Последние выполненные SQL: модель может сделать "то же самое,
+                # но за сентябрь", не угадывая запрос заново.
+                last_sqls_block = ""
+                if state.last_sqls:
+                    recent_sqls = state.last_sqls[-3:]
+                    last_sqls_block = (
+                        "\n\nПоследние выполненные SQL (для контекста):\n"
+                        + "\n".join(f"- {s}" for s in recent_sqls)
+                        + "\nЕсли пользователь просит 'то же самое, но за другой "
+                          "период' — переиспользуй эти запросы, изменив условия "
+                          "фильтрации."
+                    )
+
                 _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
                 system_content = (
                     base_prompt
                     + f"\n\nСегодня: {_now} (локальное время сервера). "
                     + "Используй эту дату для 'сегодня', 'вчера', 'на этой неделе' и т.п."
+                    + last_sqls_block
                     + (("\n\n" + schema) if schema else "")
                 )
+
+                # Долгосрочная память: факты, которые пользователь просил
+                # запомнить (/remember). Модель обязана их учитывать.
+                if state.long_term_facts:
+                    system_content += (
+                        "\n\nДолгосрочная память пользователя "
+                        "(учитывай при ответах):\n"
+                        + "\n".join(f"- {fact}" for fact in state.long_term_facts)
+                    )
 
                 # Подсказка о последней таблице
                 text_lower = msg.text.lower()
@@ -1341,6 +1582,26 @@ class RepdixEngine:
                 context_limit = self.llm_client.get_context_length(model_to_use)
                 history_chars = sum(len(str(m)) for m in state.history)
                 estimated_tokens = (len(system_content) + history_chars + len(msg.text)) // 3
+
+                # Auto-Compact: при 60% лимита сжимаем НАЧАЛО истории в резюме.
+                # Так бот не упирается в лимит и не теряет суть диалога
+                # (жёсткая обрезка по 10 сообщениям резала контекст целиком).
+                if estimated_tokens > context_limit * 0.6 and len(state.history) >= 4:
+                    compacted = await self._compact_history(
+                        state, model_to_use, state.history[:4],
+                    )
+                    if compacted:
+                        state.summary = compacted
+                        state.history = [
+                            {
+                                "role": "system",
+                                "content": "Резюме предыдущего диалога: " + compacted,
+                            }
+                        ] + state.history[4:]
+                        history_chars = sum(len(str(m)) for m in state.history)
+                        estimated_tokens = (
+                            len(system_content) + history_chars + len(msg.text)
+                        ) // 3
 
                 if estimated_tokens > context_limit * 0.8:
                     if len(state.history) > 2:
@@ -1390,6 +1651,7 @@ class RepdixEngine:
                         clean_text = re.sub(
                             r"\s+", " ", choice.get("content") or "",
                         ).strip()
+                        clean_text = re.sub(r"<[^>]+>", "", clean_text)  # статусы — plain text, без HTML
                         if clean_text:
                             await msg.status_callback(f"🤖 {clean_text}")
                         else:
@@ -1409,34 +1671,12 @@ class RepdixEngine:
                     for tool_call in tool_calls:
                         tool_name = tool_call["function"]["name"]
 
-                        if tool_name not in {"execute_sql", "get_relations", "execute_template"}:
+                        if tool_name not in {"execute_sql", "get_relations"}:
                             logger.warning("Unknown tool_call from LLM: %s", tool_name)
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call["id"],
                                 "content": f"Ошибка: неизвестный инструмент '{tool_name}'",
-                            })
-                            continue
-
-                        if tool_name == "execute_template":
-                            try:
-                                args = json.loads(tool_call["function"]["arguments"])
-                            except (json.JSONDecodeError, TypeError):
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call["id"],
-                                    "content": "Ошибка: некорректные аргументы инструмента",
-                                })
-                                continue
-                            tpl_name = args.get("template_name")
-                            tpl_limit = args.get("limit")
-                            tpl_period = args.get("period")
-
-                            result_text = await self._run_yaml_template(tpl_name, tpl_limit, tpl_period, state)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call["id"],
-                                "content": result_text,
                             })
                             continue
 
@@ -1624,6 +1864,217 @@ class RepdixEngine:
         finally:
             lock.release()
 
+    # ---------- Долгосрочная память: рендер и операции ----------
+    async def _load_memory(self, user_id: str, state: SessionState) -> list[str]:
+        """Подгружает факты из Redis, если в состоянии их ещё нет.
+
+        Нужно для callback-хэндлеров адаптера: они не проходят через
+        process_message и могут работать в «свежем» процессе.
+        """
+        if state.long_term_facts:
+            return state.long_term_facts
+        if self.cache_manager is None:
+            return state.long_term_facts
+        try:
+            raw = await self.cache_manager.get(f"repdix:memory:{user_id}")
+            if not raw:
+                return state.long_term_facts
+            loaded = json.loads(raw)
+        except Exception as e:
+            logger.warning("Не удалось загрузить память %s: %s", user_id, e)
+            return state.long_term_facts
+        if isinstance(loaded, list):
+            state.long_term_facts = [str(f) for f in loaded]
+        return state.long_term_facts
+
+    @staticmethod
+    def _fact_hash(fact: str) -> str:
+        """Короткий хэш факта для callback_data: первые 8 символов md5.
+
+        8 hex-символов влезают в лимит Telegram callback_data (64 байта)
+        и с запасом покрывают список фактов одного пользователя.
+        """
+        return hashlib.md5(str(fact).encode("utf-8")).hexdigest()[:8]
+
+    # Лимит подписи кнопки: Telegram допускает 1-64 символа на кнопку,
+    # оставляем запас под префикс «❌ N. ».
+    _MEMORY_BUTTON_LABEL_MAX = 30
+
+    @staticmethod
+    def _memory_button_label(fact: str) -> str:
+        """Готовит подпись факта для Inline-кнопки (одна строка, <=30 симв.)."""
+        label = re.sub(r"\s+", " ", str(fact or "")).strip()
+        limit = RepdixEngine._MEMORY_BUTTON_LABEL_MAX
+        if len(label) > limit:
+            label = label[:limit - 3].rstrip() + "..."
+        return label or "—"
+
+    @staticmethod
+    def _build_memory_markup(facts: list[str]) -> dict:
+        """Собирает Inline-клавиатуру для /memory (dict формата Telegram).
+
+        Кнопка удаления показывает текст факта («❌ 1. <текст>»), а
+        callback_data привязан к содержимому (mem_edit_<hash> /
+        mem_del_<hash>): индексы «плывут» после удаления, и кнопка могла
+        бы изменить/удалить не тот факт.
+        """
+        rows: list[list[dict]] = []
+        for idx, fact in enumerate(facts):
+            fact_hash = RepdixEngine._fact_hash(fact)
+            rows.append([
+                {
+                    "text": (
+                        f"❌ {idx + 1}. "
+                        f"{RepdixEngine._memory_button_label(fact)}"
+                    ),
+                    "callback_data": f"mem_del_{fact_hash}",
+                },
+                {
+                    "text": f"✏️ {idx + 1}",
+                    "callback_data": f"mem_edit_{fact_hash}",
+                },
+            ])
+        rows.append([
+            {"text": "➕ Добавить", "callback_data": "mem_add"},
+            {"text": "🗑 Очистить всё", "callback_data": "mem_clear"},
+        ])
+        return {"inline_keyboard": rows}
+
+    async def render_memory(self, user_id: str,
+                             state: SessionState | None = None) -> ChatResponse:
+        """Формирует ответ /memory: текст + кнопки управления фактами.
+
+        Текст экранируется: факты вводит пользователь, а адаптер отправляет
+        сообщение с parse_mode="HTML".
+        """
+        state = state or self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+
+        if not facts:
+            return ChatResponse(
+                text=(
+                    "🧠 Долгосрочная память пуста. Используйте "
+                    "/remember <текст> или кнопку «Добавить»."
+                ),
+                reply_markup={
+                    "inline_keyboard": [[
+                        {"text": "➕ Добавить", "callback_data": "mem_add"},
+                    ]],
+                },
+            )
+
+        lines = ["🧠 Твоя память:"]
+        for i, fact in enumerate(facts, 1):
+            lines.append(f"{i}. {html.escape(str(fact))}")
+        lines.append(
+            "Удалить или изменить факт можно кнопками ниже "
+            "(/forget <номер> тоже работает)."
+        )
+        return ChatResponse(
+            text="\n".join(lines),
+            reply_markup=self._build_memory_markup(facts),
+        )
+
+    async def memory_get(self, user_id: str, idx: int) -> str | None:
+        """Возвращает факт по индексу (0-based) или None."""
+        state = self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+        if 0 <= idx < len(facts):
+            return facts[idx]
+        return None
+
+    async def memory_find_by_hash(self, user_id: str,
+                                  fact_hash: str) -> tuple[int, str] | None:
+        """Ищет факт по хэшу (первые 8 символов md5 текста).
+
+        Returns:
+            (индекс, текст факта) или None, если факт уже удалён/изменён.
+        """
+        state = self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+        target = (fact_hash or "").strip().lower()
+        if not target:
+            return None
+        for idx, fact in enumerate(facts):
+            if self._fact_hash(fact).lower() == target:
+                return idx, fact
+        return None
+
+    async def memory_add(self, user_id: str, fact: str) -> bool:
+        """Добавляет факт в долгосрочную память."""
+        fact = (fact or "").strip()
+        if not fact:
+            return False
+        state = self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+        facts.append(fact)
+        await self._save_memory(user_id, facts)
+        return True
+
+    async def memory_update(self, user_id: str, idx: int, fact: str) -> bool:
+        """Заменяет факт по индексу (0-based)."""
+        fact = (fact or "").strip()
+        if not fact:
+            return False
+        state = self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+        if not (0 <= idx < len(facts)):
+            return False
+        facts[idx] = fact
+        await self._save_memory(user_id, facts)
+        return True
+
+    async def memory_delete(self, user_id: str, idx: int) -> bool:
+        """Удаляет факт по индексу (0-based)."""
+        state = self.sessions.get(user_id)
+        facts = await self._load_memory(user_id, state)
+        if not (0 <= idx < len(facts)):
+            return False
+        facts.pop(idx)
+        await self._save_memory(user_id, facts)
+        return True
+
+    async def memory_delete_by_hash(self, user_id: str, fact_hash: str) -> bool:
+        """Удаляет факт по хэшу. False — факт уже удалён/изменён."""
+        found = await self.memory_find_by_hash(user_id, fact_hash)
+        if found is None:
+            return False
+        idx, _fact = found
+        return await self.memory_delete(user_id, idx)
+
+    async def memory_update_by_hash(self, user_id: str, fact_hash: str,
+                                     fact: str) -> bool:
+        """Заменяет факт по хэшу. False — факт уже удалён/изменён."""
+        found = await self.memory_find_by_hash(user_id, fact_hash)
+        if found is None:
+            return False
+        idx, _old = found
+        return await self.memory_update(user_id, idx, fact)
+
+    async def memory_clear(self, user_id: str) -> None:
+        """Полностью очищает долгосрочную память пользователя."""
+        state = self.sessions.get(user_id)
+        state.long_term_facts = []
+        await self._save_memory(user_id, [])
+
+    # ---------- Долгосрочная память ----------
+    async def _save_memory(self, user_id: str, facts: list[str]) -> None:
+        """Сохраняет долгосрочную память пользователя в Redis (TTL 30 дней).
+
+        При отсутствии/сбое Redis просто логируем — факты остаются в
+        state.long_term_facts на время жизни процесса (graceful degradation).
+        """
+        if self.cache_manager is None:
+            return
+        try:
+            await self.cache_manager.set(
+                f"repdix:memory:{user_id}",
+                json.dumps(facts, ensure_ascii=False),
+                ttl=30 * 86400,
+            )
+        except Exception as e:
+            logger.warning("Не удалось сохранить память %s: %s", user_id, e)
+
     # ---------- Сохранение истории ----------
     async def _save_history(self, state: SessionState, user_id: str,
                              user_text: str, assistant_text: str) -> None:
@@ -1647,7 +2098,10 @@ class RepdixEngine:
         if self.cache_manager is not None:
             await self.cache_manager.set(
                 f"repdix:history:{user_id}",
-                json.dumps(state.history, ensure_ascii=False),
+                json.dumps(
+                    {"history": state.history, "summary": state.summary},
+                    ensure_ascii=False,
+                ),
                 ttl=86400,
             )
 
