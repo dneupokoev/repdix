@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261029.06'
+dv_file_version = '261029.07'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -152,6 +152,7 @@ class RBACGuard:
         user_roles: list[str],
         schemas: list[str],
         default_schema: str = "",
+        all_tables: list[str] | None = None,
     ) -> set[str]:
         """Возвращает множество разрешённых таблиц (в нижнем регистре).
 
@@ -160,11 +161,22 @@ class RBACGuard:
         возвращается как {"*"} — вызывающий код сам разворачивает его во все
         схемы из schemas.
 
+        Правило вида "schema.*" (все таблицы схемы) разворачивается в
+        конкретные fully-qualified имена ТОЛЬКО если передан all_tables.
+        Без all_tables ключ "schema.*" возвращается как есть — обратная
+        совместимость для вызывающего кода, который разворачивает его сам.
+
         Args:
             user_roles: Роли пользователя.
             schemas: Список доступных схем (для документации; wildcard
                 разворачивает вызывающий код).
             default_schema: Схема для коротких ключей.
+            all_tables: Реальный список таблиц из БД в формате
+                "schema.table" (lower-case не обязателен). Нужен для
+                разворачивания правил "schema.*" в конкретные таблицы:
+                без него engine не смог бы сопоставить "db_analysis.*" с
+                "db_analysis.pbi_centers_monthly". Если None — правила
+                "schema.*" не разворачиваются (возвращаются как есть).
         """
         self._load_config()
         rules = self._collect_rules(user_roles)
@@ -177,6 +189,17 @@ class RBACGuard:
                 continue
             if k == "*":
                 result.add("*")
+            elif k.endswith(".*"):
+                schema_prefix = k[:-2].strip()
+                if all_tables is not None and schema_prefix:
+                    prefix = f"{schema_prefix}."
+                    for full in all_tables:
+                        full_l = str(full).strip().lower()
+                        if full_l.startswith(prefix):
+                            result.add(full_l)
+                else:
+                    # Обратная совместимость: разворачивает вызывающий код.
+                    result.add(k)
             elif "." in k:
                 result.add(k)
             elif default_schema_l:
@@ -499,7 +522,9 @@ class RBACGuard:
         Порядок (строгий):
           1. Точное qualified-совпадение schema.table.
           2. Wildcard "*" (все таблицы).
-          3. Правило без схемы (короткое имя) — только если schema_name пуст.
+          3. Wildcard схемы "schema.*" (все таблицы схемы) — если схема
+             известна и такое правило задано в roles.yaml.
+          4. Правило без схемы (короткое имя) — только если schema_name пуст.
              Это осознанное ограничение: правило без схемы не даёт доступа к
              одноимённой таблице в другой схеме.
 
@@ -515,7 +540,11 @@ class RBACGuard:
         if "*" in rules:
             return rules["*"]
 
-        # 3. Короткое имя — только если схема не указана
+        # 3. Wildcard схемы: "schema.*" применяется ко всем таблицам схемы
+        if schema_name and f"{schema_name}.*" in rules:
+            return rules[f"{schema_name}.*"]
+
+        # 4. Короткое имя — только если схема не указана
         if not schema_name and tbl_name in rules:
             return rules[tbl_name]
 

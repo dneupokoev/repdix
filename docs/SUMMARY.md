@@ -36,6 +36,8 @@ Telegram-бот-оркестратор аналитики: принимает в
 
 Проект построен по принципу **«Порты и Адаптеры»**: ядро не знает о Telegram, всё общение идёт через абстрактные интерфейсы. Благодаря этому бизнес-логика не зависит от конкретного мессенджера, а адаптеры подключаются через общий контракт.
 
+Документация модулей сгруппирована по слоям: точка входа, ядро приложения и интерфейсы мессенджеров.
+
 ## Модули проекта
 
 ### Точка входа
@@ -44,13 +46,13 @@ Telegram-бот-оркестратор аналитики: принимает в
 
 ### Ядро (`app/core`)
 
-- [engine](modules/app/core/engine.md) — мессенджер-независимый диспетчер `ChatMessage`: обработка slash-команд (`/help`, `/db`, `/model`, `/sql`, `/history`, `/tokens`, `/settings` и др.), детерминированные запросы, LLM-агент с tool-calling до 5 шагов (`execute_sql`, `get_relations`, `execute_template`), RBAC-фильтрация SQL, аудит `manual`/`llm`, история диалога, кэш и защита от параллельных запросов через `state.lock`.
+- [engine](modules/app/core/engine.md) — мессенджер-независимый диспетчер `ChatMessage`: обработка slash-команд (`/help`, `/db`, `/model`, `/models`, `/sql`, `/clear`, `/tokens`, `/history`, `/compact`, `/settings` и др.), детерминированные запросы по таблицам, LLM-агент с tool-calling до 5 шагов (`execute_sql`, `get_relations`, `execute_template`), multi-schema RBAC-фильтрация, аудит `manual`/`llm`, история диалога, кэш и защита от параллельных запросов через `state.lock`.
 - [session](modules/app/core/session.md) — in-memory состояние пользователей: история, выбранные БД/модель, `asyncio.Lock`, текущая задача для `/stop`, последние SQL и TTL-очистка неактивных сессий.
-- [db_manager](modules/app/core/db_manager.md) — асинхронные пулы MySQL/PostgreSQL/SQLite: загрузка YAML-конфигурации с `${VAR}`, выполнение SQL и параметризованных запросов, получение таблиц и схем, таймауты, read-only, `technical_filter` и безопасное закрытие соединений.
+- [db_manager](modules/app/core/db_manager.md) — асинхронные пулы MySQL/PostgreSQL/SQLite: загрузка YAML-конфигурации с подстановкой `${VAR}`, выполнение SQL и параметризованных запросов, таймауты, read-only, multi-schema поддержка (`schemas`, `exclude_schemas`, `description`), получение схем/таблиц/колонок, TTL-кэш метаданных, `technical_filter` и безопасное закрытие соединений.
 - [user_manager](modules/app/core/user_manager.md) — управление `users.yaml` с hot-reload: заявки, одобрение/отклонение, роли, активность, env-админы, админ-панель и синхронизация администраторов.
 - [llm_client](modules/app/core/llm_client.md) — асинхронная обёртка над `AsyncOpenAI`: загрузка `models.yaml`, hot-reload, выбор модели, лимиты контекста, `chat`, `tools`, `tool_choice`, `response_format`, retry-fallback и закрытие клиентов.
 - [cache_manager](modules/app/core/cache_manager.md) — обёртка над `redis.asyncio` с graceful degradation: `ping`/`healthcheck`, `get`/`set`/`delete`, TTL и безопасная работа при ошибках Redis.
-- [rbac_guard](modules/app/core/rbac_guard.md) — RBAC-проверка SQL по `roles.yaml`: полное имя `schema.table`, `default_schema`, ограничение `SELECT *` при `excluded_columns`, предварительная блокировка технических таблиц/колонок (в т.ч. через `technical_columns_getter`), разбор `sqlglot` с диалектом mysql и hot-reload.
+- [rbac_guard](modules/app/core/rbac_guard.md) — RBAC-проверка SQL по `roles.yaml`: полное имя `schema.table`, `default_schema`, ограничение `SELECT *` при `excluded_columns` и технических колонках, предварительная блокировка технических таблиц/колонок до RBAC-правил, разбор `sqlglot` с диалектом mysql и hot-reload.
 - [technical_filter](modules/app/core/technical_filter.md) — определение технических имён по префиксам (`TECHNICAL_PREFIXES`, по умолчанию `technical_`), поддержка коротких и fully-qualified имён (`schema.table`, `schema.table.column`) без учёта регистра; используется для скрытия и блокировки технических сущностей.
 - [validator](modules/app/core/validator.md) — предварительная проверка безопасности SQL: разрешает только `SELECT`/`WITH`, блокирует DML/DDL, опасные паттерны, множественные запросы, нулевые байты и слишком длинный SQL.
 

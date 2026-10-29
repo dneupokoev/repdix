@@ -16,6 +16,10 @@ roles:
     tables:
       users:
         allowed_columns: "*"
+  reader_schema:
+    tables:
+      "db_analysis.*":
+        allowed_columns: "*"
 """
 
 
@@ -46,6 +50,37 @@ def test_get_allowed_tables_short(tmp_path):
     assert guard.get_allowed_tables(
         ["reader_short"], ["db_a", "db_b"], "db_a",
     ) == {"db_a.users"}
+
+
+def test_get_allowed_tables_schema_wildcard(tmp_path):
+    """Правило "schema.*" разворачивается в конкретные таблицы схемы."""
+    guard = make_guard(tmp_path)
+    result = guard.get_allowed_tables(
+        ["reader_schema"],
+        ["db_analysis", "db_itzamna"],
+        "db_analysis",
+        all_tables=[
+            "db_analysis.pbi_centers_monthly",
+            "db_analysis.pbi_doctors_monthly",
+            "db_itzamna.c2t_queue_analysis",
+        ],
+    )
+
+    assert "db_analysis.pbi_centers_monthly" in result
+    assert "db_analysis.pbi_doctors_monthly" in result
+    assert "db_itzamna.c2t_queue_analysis" not in result
+
+
+def test_get_allowed_tables_schema_wildcard_without_all_tables(tmp_path):
+    """Без all_tables правило "schema.*" возвращается как есть."""
+    guard = make_guard(tmp_path)
+    result = guard.get_allowed_tables(
+        ["reader_schema"],
+        ["db_analysis", "db_itzamna"],
+        "db_analysis",
+    )
+
+    assert result == {"db_analysis.*"}
 
 
 # ---------------------------------------------------------------------------

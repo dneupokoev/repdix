@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261029.07'
+dv_file_version = '261029.08'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
 
 Ключевые изменения версии 261029.06:
@@ -678,6 +678,15 @@ class RepdixEngine:
             logger.error("Ошибка получения схем из БД: %s", e)
             return ""
 
+        # 2) Реальный список таблиц (fully-qualified: schema.table).
+        # Получаем ДО get_allowed_tables(): all_tables нужен для разворачивания
+        # правил вида "schema.*" (все таблицы схемы) в конкретные таблицы.
+        try:
+            all_tables = await self.db_manager.get_table_list(state.current_db)
+        except Exception as e:
+            logger.error("Ошибка получения таблиц из БД: %s", e)
+            return ""
+
         if is_admin:
             allowed_schemas: set[str] = set(schemas)
             allowed_tables_marker: set[str] = {"*"}
@@ -687,7 +696,7 @@ class RepdixEngine:
                 user_roles, schemas, default_schema,
             )
             allowed_tables_marker = self.rbac.get_allowed_tables(
-                user_roles, schemas, default_schema,
+                user_roles, schemas, default_schema, all_tables=all_tables,
             )
             self.rbac._load_config()
             rules = self.rbac._collect_rules(user_roles)
@@ -695,13 +704,6 @@ class RepdixEngine:
         wildcard_tables = "*" in allowed_tables_marker
         if not allowed_schemas and not wildcard_tables:
             return "У вас нет доступа ни к одной таблице."
-
-        # 2) Реальный список таблиц (fully-qualified: schema.table)
-        try:
-            all_tables = await self.db_manager.get_table_list(state.current_db)
-        except Exception as e:
-            logger.error("Ошибка получения таблиц из БД: %s", e)
-            return ""
 
         # 3) Фильтрация по схемам и RBAC-правилам
         target: list[tuple[str, str, dict | None]] = []
