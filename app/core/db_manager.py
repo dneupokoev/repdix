@@ -1,6 +1,15 @@
 # app/core/db_manager.py
-dv_file_version = '261029.01'
+dv_file_version = '261029.02'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite).
+
+Ключевые изменения версии 261029.02:
+- Поддержка нескольких схем в одной MySQL-БД: конфиг `schemas` (список или
+  "auto"), `exclude_schemas`, `description`.
+- get_schemas(), get_db_description(), get_db_display_name().
+- get_table_list()/get_table_schema() принимают schema= и работают с
+  fully-qualified именами (schema.table). ЭТО BREAKING CHANGE.
+- In-memory кэш схемы/таблиц/колонок с TTL (SCHEMA_CACHE_TTL_SEC, 3600),
+  invalidate_schema_cache(), очистка кэша в close().
 
 Ключевые изменения версии 261027.06:
 - MySQL: MAX_EXECUTION_TIME теперь ставится через init_command при создании
@@ -46,6 +55,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import aiosqlite
@@ -71,6 +81,14 @@ class DBManager:
         self.pools: dict[str, Any] = {}
         self.config: dict = {}
         self.query_timeout = int(os.environ.get("SQL_QUERY_TIMEOUT") or "15")
+        try:
+            self.schema_cache_ttl = int(
+                os.environ.get("SCHEMA_CACHE_TTL_SEC") or "3600"
+            )
+        except (TypeError, ValueError):
+            self.schema_cache_ttl = 3600
+        # key -> (monotonic_timestamp, data)
+        self._schema_cache: dict[tuple, tuple[float, Any]] = {}
         self.load_config()
 
     # ------------------------------------------------------------------
@@ -132,6 +150,135 @@ class DBManager:
     def get_db_type(self, name: str) -> str:
         """Возвращает тип БД (mysql/postgresql/sqlite) в нижнем регистре."""
         return (self.get_db_config(name).get('type') or '').lower()
+
+    def get_db_description(self, name: str) -> str:
+        """Возвращает описание БД из конфига (или пустую строку)."""
+        conf = self.get_db_config(name)
+        return (conf.get("description") or "").strip()
+
+    def get_db_display_name(self, name: str) -> str:
+        """Возвращает "name — description" (или просто name без описания)."""
+        desc = self.get_db_description(name)
+        return f"{name} — {desc}" if desc else name
+
+    # ------------------------------------------------------------------
+    # Кэш метаданных (схемы/таблицы/колонки)
+    # ------------------------------------------------------------------
+    def _cache_get(self, key: tuple) -> Any | None:
+        """Возвращает закэшированное значение или None, если нет/устарело."""
+        entry = self._schema_cache.get(key)
+        if entry is None:
+            return None
+        ts, data = entry
+        if time.monotonic() - ts > self.schema_cache_ttl:
+            self._schema_cache.pop(key, None)
+            return None
+        return data
+
+    def _cache_set(self, key: tuple, data: Any) -> None:
+        """Кладёт значение в кэш с текущим timestamp."""
+        self._schema_cache[key] = (time.monotonic(), data)
+
+    def invalidate_schema_cache(self, db_name: str | None = None) -> None:
+        """Сбрасывает кэш метаданных.
+
+        Args:
+            db_name: None — очистить весь кэш; иначе удалить все ключи,
+                в которых встречается это имя БД.
+        """
+        if db_name is None:
+            self._schema_cache.clear()
+            return
+        for key in list(self._schema_cache.keys()):
+            if db_name in key:
+                self._schema_cache.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # Схемы
+    # ------------------------------------------------------------------
+    async def get_schemas(self, db_name: str) -> list[str]:
+        """Возвращает список схем (database) для указанной БД.
+
+        Логика:
+          - schemas: [..] — явный список (technical_* отфильтровываются);
+          - schemas: "auto" — MySQL: опрос information_schema.schemata с
+            вычитанием exclude_schemas и технических схем;
+          - не задано — fallback [conf["database"]] (для SQLite — ["main"]).
+
+        При ошибке SQL логируется warning и возвращается fallback.
+        """
+        cache_key = ("schemas", db_name)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        conf = self.get_db_config(db_name)
+        db_type = (conf.get("type") or "").lower()
+        fallback_db = (conf.get("database") or "").strip()
+
+        def _fallback() -> list[str]:
+            if db_type == "sqlite":
+                return ["main"]
+            if fallback_db and not is_technical(fallback_db):
+                return [fallback_db]
+            return []
+
+        schemas_conf = conf.get("schemas")
+
+        if isinstance(schemas_conf, str) and schemas_conf.strip().lower() == "auto":
+            if db_type == "mysql":
+                exclude_raw = conf.get("exclude_schemas")
+                if not isinstance(exclude_raw, list):
+                    exclude_raw = [
+                        "mysql",
+                        "information_schema",
+                        "performance_schema",
+                        "sys",
+                    ]
+                exclude_l = {str(e).lower() for e in exclude_raw}
+                try:
+                    rows = await self.execute_query(
+                        db_name,
+                        "SELECT schema_name FROM information_schema.schemata",
+                    )
+                    names: list[str] = []
+                    for row in rows or []:
+                        value = None
+                        for k, v in row.items():
+                            if str(k).lower() == "schema_name":
+                                value = v
+                                break
+                        if value is None:
+                            continue
+                        s = str(value)
+                        if s.lower() in exclude_l or is_technical(s):
+                            continue
+                        names.append(s)
+                    names.sort()
+                    self._cache_set(cache_key, names)
+                    return names
+                except Exception as e:
+                    logger.warning(
+                        "get_schemas(auto) failed for %s: %s", db_name, e
+                    )
+                    return _fallback()
+            # postgresql/sqlite: auto вне текущей задачи
+            result = _fallback()
+            self._cache_set(cache_key, result)
+            return result
+
+        if isinstance(schemas_conf, list):
+            result = [
+                str(s)
+                for s in schemas_conf
+                if s and not is_technical(str(s))
+            ]
+            self._cache_set(cache_key, result)
+            return result
+
+        result = _fallback()
+        self._cache_set(cache_key, result)
+        return result
 
     # ------------------------------------------------------------------
     # Подключение
@@ -313,67 +460,101 @@ class DBManager:
     # ------------------------------------------------------------------
     # Метаданные
     # ------------------------------------------------------------------
-    async def get_table_list(self, db_name: str) -> list[str]:
-        """Возвращает список имён таблиц в указанной БД."""
-        if db_name not in self.pools:
-            await self.connect(db_name)
+    async def get_table_list(
+        self, db_name: str, schema: str | None = None,
+    ) -> list[str]:
+        """Возвращает список таблиц в виде fully-qualified имён "schema.table".
 
+        Args:
+            db_name: Имя БД из конфигурации.
+            schema: Конкретная схема. Если None — обходятся все схемы из
+                get_schemas(db_name).
+
+        Returns:
+            Отсортированный список "schema.table" без технических таблиц.
+        """
+        cache_key = ("tables", db_name, schema or "*")
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        schemas = [schema] if schema is not None else await self.get_schemas(db_name)
+
+        result: list[str] = []
+        for sch in schemas:
+            try:
+                tables = await self._fetch_tables(db_name, sch)
+            except NotImplementedError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "get_table_list(%s, %s) failed: %s", db_name, sch, e
+                )
+                continue
+            for tbl in tables:
+                if not tbl or is_technical(tbl):
+                    continue
+                result.append(f"{sch}.{tbl}" if sch else tbl)
+
+        result = sorted(set(result))
+        self._cache_set(cache_key, result)
+        return result
+
+    async def _fetch_tables(self, db_name: str, schema: str) -> list[str]:
+        """Возвращает короткие имена таблиц одной схемы (без фильтрации)."""
         db_type = self.get_db_type(db_name)
-        pool = self.pools[db_name]
 
         if db_type == 'mysql':
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema = DATABASE() "
-                        "ORDER BY table_name"
-                    )
-                    rows = await cur.fetchall()
-                    if not rows:
-                        return []
-                    result = []
-                    for row in rows:
-                        normalized = {k.lower(): v for k, v in row.items()}
-                        tbl = normalized.get("table_name", "")
-                        if tbl and not is_technical(tbl):
-                            result.append(tbl)
-                    return result
-
-        elif db_type == 'postgresql':
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = 'public' "
-                    "ORDER BY table_name"
-                )
-            return (
-                [
-                    row['table_name']
-                    for row in rows
-                    if not is_technical(row['table_name'])
-                ]
-                if rows else []
+            rows = await self.execute_query(
+                db_name,
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = %s "
+                "ORDER BY table_name",
+                (schema,),
             )
-
+            value_key = "table_name"
+        elif db_type == 'postgresql':
+            rows = await self.execute_query(
+                db_name,
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = $1 "
+                "ORDER BY table_name",
+                (schema,),
+            )
+            value_key = "table_name"
         elif db_type == 'sqlite':
-            cursor = await pool.execute(
+            rows = await self.execute_query(
+                db_name,
                 "SELECT name FROM sqlite_master "
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-                "ORDER BY name"
+                "ORDER BY name",
             )
-            rows = await cursor.fetchall()
-            await cursor.close()
-            return (
-                [row[0] for row in rows if not is_technical(row[0])]
-                if rows else []
-            )
-
+            value_key = "name"
         else:
             raise NotImplementedError(f"db type {db_type} not supported yet")
 
-    async def get_table_schema(self, db_name: str, table_name: str) -> list[dict]:
+        result: list[str] = []
+        for row in rows or []:
+            value = None
+            for k, v in row.items():
+                if str(k).lower() == value_key:
+                    value = v
+                    break
+            if value is None:
+                continue
+            result.append(str(value))
+        return result
+
+    async def get_table_schema(
+        self, db_name: str, table_name: str, schema: str | None = None,
+    ) -> list[dict]:
         """Возвращает список полей и их описаний для указанной таблицы.
+
+        Args:
+            db_name: Имя БД из конфигурации.
+            table_name: Имя таблицы (без схемы).
+            schema: Схема. Если None — берётся conf["database"]
+                (для SQLite — "main").
 
         Returns:
             Список словарей с ключами column_name, data_type, column_comment.
@@ -381,75 +562,79 @@ class DBManager:
         if not table_name:
             return []
 
-        if db_name not in self.pools:
-            await self.connect(db_name)
-
         db_type = self.get_db_type(db_name)
-        pool = self.pools[db_name]
+        if schema is None:
+            schema = (self.get_db_config(db_name).get("database") or "").strip()
+            if db_type == "sqlite":
+                schema = "main"
+
+        cache_key = ("columns", db_name, schema or "*", table_name)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         if db_type == 'mysql':
-            async with pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT column_name, data_type, column_comment "
-                        "FROM information_schema.columns "
-                        "WHERE table_schema = DATABASE() AND table_name = %s "
-                        "ORDER BY ordinal_position",
-                        (table_name,)
-                    )
-                    rows = await cur.fetchall()
-                    if not rows:
-                        return []
-                    result = []
-                    for row in rows:
-                        normalized = {k.lower(): v for k, v in row.items()}
-                        col_name = normalized.get("column_name", "")
-                        if is_technical(col_name):
-                            continue
-                        result.append({
-                            "column_name": col_name,
-                            "data_type": normalized.get("data_type", ""),
-                            "column_comment": normalized.get("column_comment", "") or "",
-                        })
-                    return result
+            rows = await self.execute_query(
+                db_name,
+                "SELECT column_name, data_type, column_comment "
+                "FROM information_schema.columns "
+                "WHERE table_schema = %s AND table_name = %s "
+                "ORDER BY ordinal_position",
+                (schema, table_name),
+            )
+            result = []
+            for row in rows or []:
+                normalized = {str(k).lower(): v for k, v in row.items()}
+                col_name = normalized.get("column_name", "")
+                if is_technical(col_name):
+                    continue
+                result.append({
+                    "column_name": col_name,
+                    "data_type": normalized.get("data_type", ""),
+                    "column_comment": normalized.get("column_comment", "") or "",
+                })
+            self._cache_set(cache_key, result)
+            return result
 
         elif db_type == 'postgresql':
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT c.column_name, c.data_type, "
-                    "       COALESCE(d.description, '') AS column_comment "
-                    "FROM information_schema.columns c "
-                    "LEFT JOIN pg_catalog.pg_statio_all_tables st "
-                    "  ON st.schemaname = c.table_schema AND st.relname = c.table_name "
-                    "LEFT JOIN pg_catalog.pg_description d "
-                    "  ON d.objoid = st.relid AND d.objsubid = c.ordinal_position "
-                    "WHERE c.table_schema = 'public' AND c.table_name = $1 "
-                    "ORDER BY c.ordinal_position",
-                    table_name
-                )
-            return (
-                [
-                    dict(row)
-                    for row in rows
-                    if not is_technical(row["column_name"])
-                ]
-                if rows else []
+            rows = await self.execute_query(
+                db_name,
+                "SELECT c.column_name, c.data_type, "
+                "       COALESCE(d.description, '') AS column_comment "
+                "FROM information_schema.columns c "
+                "LEFT JOIN pg_catalog.pg_statio_all_tables st "
+                "  ON st.schemaname = c.table_schema AND st.relname = c.table_name "
+                "LEFT JOIN pg_catalog.pg_description d "
+                "  ON d.objoid = st.relid AND d.objsubid = c.ordinal_position "
+                "WHERE c.table_schema = $1 AND c.table_name = $2 "
+                "ORDER BY c.ordinal_position",
+                (schema, table_name),
             )
+            result = [
+                dict(row)
+                for row in (rows or [])
+                if not is_technical(row["column_name"])
+            ]
+            self._cache_set(cache_key, result)
+            return result
 
         elif db_type == 'sqlite':
+            if db_name not in self.pools:
+                await self.connect(db_name)
+            pool = self.pools[db_name]
             if not re.fullmatch(r'[A-Za-z0-9_]+', table_name):
                 logger.warning("Invalid table_name for SQLite PRAGMA: %s", table_name)
                 return []
             cursor = await pool.execute(f"PRAGMA table_info({table_name})")
             rows = await cursor.fetchall()
             await cursor.close()
-            if not rows:
-                return []
-            return [
+            result = [
                 {"column_name": row[1], "data_type": row[2], "column_comment": ""}
-                for row in rows
+                for row in (rows or [])
                 if not is_technical(row[1])
             ]
+            self._cache_set(cache_key, result)
+            return result
 
         else:
             raise NotImplementedError(f"db type {db_type} not supported yet")
@@ -492,3 +677,4 @@ class DBManager:
                 self.pools.pop(name, None)
 
         self.pools.clear()
+        self._schema_cache.clear()

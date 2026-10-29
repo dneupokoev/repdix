@@ -44,13 +44,14 @@ Telegram-бот-оркестратор аналитики: принимает в
 
 ### Ядро (`app/core`)
 
-- [engine](modules/app/core/engine.md) — мессенджер-независимый диспетчер: обработка `ChatMessage`, slash-команды, детерминированные запросы, LLM tool-calling loop, RBAC-фильтрация SQL, аудит, история диалога и кэш.
+- [engine](modules/app/core/engine.md) — мессенджер-независимый диспетчер `ChatMessage`: обработка slash-команд (`/help`, `/db`, `/model`, `/sql`, `/history`, `/tokens`, `/settings` и др.), детерминированные запросы, LLM-агент с tool-calling до 5 шагов (`execute_sql`, `get_relations`, `execute_template`), RBAC-фильтрация SQL, аудит `manual`/`llm`, история диалога, кэш и защита от параллельных запросов через `state.lock`.
 - [session](modules/app/core/session.md) — in-memory состояние пользователей: история, выбранные БД/модель, `asyncio.Lock`, текущая задача для `/stop`, последние SQL и TTL-очистка неактивных сессий.
-- [db_manager](modules/app/core/db_manager.md) — асинхронные пулы MySQL/PostgreSQL/SQLite, загрузка YAML-конфигурации с `${VAR}`, выполнение SQL, получение таблиц и схем, таймауты, read-only и закрытие соединений.
+- [db_manager](modules/app/core/db_manager.md) — асинхронные пулы MySQL/PostgreSQL/SQLite: загрузка YAML-конфигурации с `${VAR}`, выполнение SQL и параметризованных запросов, получение таблиц и схем, таймауты, read-only, `technical_filter` и безопасное закрытие соединений.
 - [user_manager](modules/app/core/user_manager.md) — управление `users.yaml` с hot-reload: заявки, одобрение/отклонение, роли, активность, env-админы, админ-панель и синхронизация администраторов.
 - [llm_client](modules/app/core/llm_client.md) — асинхронная обёртка над `AsyncOpenAI`: загрузка `models.yaml`, hot-reload, выбор модели, лимиты контекста, `chat`, `tools`, `tool_choice`, `response_format`, retry-fallback и закрытие клиентов.
 - [cache_manager](modules/app/core/cache_manager.md) — обёртка над `redis.asyncio` с graceful degradation: `ping`/`healthcheck`, `get`/`set`/`delete`, TTL и безопасная работа при ошибках Redis.
-- [rbac_guard](modules/app/core/rbac_guard.md) — RBAC-проверка SQL по `roles.yaml`: доступ к `schema.table`, `default_schema`, ограничение `SELECT *` при `excluded_columns`, разбор через `sqlglot` и hot-reload.
+- [rbac_guard](modules/app/core/rbac_guard.md) — RBAC-проверка SQL по `roles.yaml`: полное имя `schema.table`, `default_schema`, ограничение `SELECT *` при `excluded_columns`, предварительная блокировка технических таблиц/колонок (в т.ч. через `technical_columns_getter`), разбор `sqlglot` с диалектом mysql и hot-reload.
+- [technical_filter](modules/app/core/technical_filter.md) — определение технических имён по префиксам (`TECHNICAL_PREFIXES`, по умолчанию `technical_`), поддержка коротких и fully-qualified имён (`schema.table`, `schema.table.column`) без учёта регистра; используется для скрытия и блокировки технических сущностей.
 - [validator](modules/app/core/validator.md) — предварительная проверка безопасности SQL: разрешает только `SELECT`/`WITH`, блокирует DML/DDL, опасные паттерны, множественные запросы, нулевые байты и слишком длинный SQL.
 
 ### Интерфейсы (`app/interfaces`)

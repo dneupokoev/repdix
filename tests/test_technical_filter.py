@@ -69,3 +69,7 @@ def test_is_technical_qualified_short_name():
 def test_is_technical_qualified_empty_and_none():
     assert is_technical_qualified("") is False
     assert is_technical_qualified(None) is False
+
+
+def test_is_technical_qualified_multi_part():
+    assert is_technical_qualified("db.technical_foo.bar") is True

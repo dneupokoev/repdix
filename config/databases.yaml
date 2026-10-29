@@ -6,7 +6,10 @@ databases:
     user: ${DB_MAIN_USER}
     password: ${DB_MAIN_PASSWORD}
     database: ${DB_MAIN_NAME}
+    schemas: auto
+    exclude_schemas: [mysql, information_schema, performance_schema, sys]
     readonly: true
+    description: "Основная БД"
 
   pg_local:
     type: postgresql

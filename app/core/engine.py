@@ -1,6 +1,20 @@
 # app/core/engine.py
-dv_file_version = '261029.05'
+dv_file_version = '261029.07'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
+
+Ключевые изменения версии 261029.06:
+- Multi-schema: _get_db_schema() фильтрует схемы через
+  rbac.get_allowed_schemas(), таблицы — через rbac.get_allowed_tables();
+  таблицы выводятся fully-qualified (schema.table).
+- _describe_table() принимает schema и table раздельно.
+- _extract_table_from_sql() возвращает (schema, table).
+- _format_sql_result() принимает schema= (для корректного get_table_schema).
+- _extract_last_table_from_history() возвращает "schema.table", если схема
+  была указана в SQL.
+- /db, /db <name>, /settings показывают описания БД (get_db_display_name),
+  доступные схемы (с учётом RBAC) и схему по умолчанию.
+- _build_base_prompt(db_type, schemas, default_schema) — в промпт добавлен
+  список доступных схем и требование указывать схему перед таблицей.
 
 Ключевые изменения версии 261027.02:
 - Убран get_table_schema из инструментов и промпта (см. README: "Не возвращайте!").
@@ -128,13 +142,25 @@ TOOLS_DEFINITION: list[dict] = [
 # ----------------------------------------------------------------------
 # Промпт (вынесен из метода для читаемости и возможного hot-reload в будущем)
 # ----------------------------------------------------------------------
-def _build_base_prompt(db_type: str) -> str:
+def _build_base_prompt(
+    db_type: str,
+    schemas: list[str] | None = None,
+    default_schema: str = "",
+) -> str:
     """Собирает системный промпт с учётом диалекта БД.
 
     Args:
         db_type: "mysql", "postgresql" или "sqlite".
+        schemas: Доступные пользователю схемы (multi-schema).
+        default_schema: Схема, подставляемая, если в SQL схема не указана.
     """
     db_type = (db_type or "mysql").lower()
+    schemas_line = (
+        f"Доступные схемы: {', '.join(schemas or []) or '—'}. "
+        f"Схема по умолчанию: {default_schema or '—'}. "
+        "Всегда указывай схему перед именем таблицы. JOIN между схемами разрешён, "
+        "если обе схемы в списке доступных.\n"
+    )
 
     if db_type == "mysql":
         dialect_line = (
@@ -171,6 +197,7 @@ def _build_base_prompt(db_type: str) -> str:
     return (
         dialect_line
         + info_schema_line
+        + schemas_line
         + "Ты — старший аналитик данных (Senior Data Analyst). Твоя задача — не просто "
         "находить цифры, а находить ПРИЧИНЫ явлений (почему упали продажи, почему выросла "
         "нагрузка, кто виноват в простое).\n"
@@ -274,6 +301,7 @@ class RepdixEngine:
 
     # ---------- Форматирование результата SQL ----------
     async def _format_sql_result(self, rows: list[dict], db_name: str | None = None,
+                                  schema: str | None = None,
                                   table_name: str | None = None) -> str:
         """Форматирует результат SQL в компактный текст.
 
@@ -315,7 +343,9 @@ class RepdixEngine:
         text_columns = set()
         if db_name and table_name and self.db_manager:
             try:
-                schema_info = await self.db_manager.get_table_schema(db_name, table_name)
+                schema_info = await self.db_manager.get_table_schema(
+                    db_name, table_name, schema,
+                )
                 for col in schema_info:
                     if col.get("data_type", "").lower() in ("text", "mediumtext", "longtext", "json"):
                         text_columns.add(col.get("column_name", "").lower())
@@ -345,12 +375,30 @@ class RepdixEngine:
 
         return result_text
 
-    def _extract_table_from_sql(self, sql: str) -> str | None:
-        """Пытается извлечь имя таблицы из SQL (без схемы)."""
+    def _extract_table_from_sql(self, sql: str) -> tuple[str | None, str] | None:
+        """Извлекает (schema, table) из первого FROM-выражения.
+
+        Returns:
+            (schema, table) или None, если таблица не найдена. schema=None,
+            если в SQL схема не указана.
+        """
         match = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', sql, re.IGNORECASE)
-        if match:
-            return match.group(1).split(".")[-1]
-        return None
+        if not match:
+            return None
+        raw = match.group(1)
+        if "." in raw:
+            schema, table = raw.split(".", 1)
+            return (schema or None), table
+        return None, raw
+
+    @staticmethod
+    def _split_qualified(name: str, default_schema: str = "") -> tuple[str, str]:
+        """Делит "schema.table" на (schema, table); короткое имя — default_schema."""
+        raw = str(name or "")
+        if "." in raw:
+            schema, table = raw.split(".", 1)
+            return schema.lower(), table
+        return (default_schema or "").lower(), raw
 
     def _shorten_text(self, text: str, max_len: int = 120) -> str:
         """Обрезает текст до max_len символов, удаляя вступления."""
@@ -383,26 +431,30 @@ class RepdixEngine:
     def _extract_last_table_from_history(self, state: SessionState) -> str | None:
         """Ищет последнюю таблицу в state.last_sqls, затем в history.
 
-        Сначала проверяем last_sqls (в обратном порядке), затем историю.
+        Возвращает "schema.table", если схема была указана в SQL, иначе
+        короткое имя таблицы.
         """
+
+        def _extract(content: str) -> str | None:
+            m = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', content, re.IGNORECASE)
+            if not m:
+                return None
+            raw = m.group(1)
+            if raw.split(".")[-1].lower() in {"information_schema", "sqlite_master"}:
+                return None
+            return raw
+
         # 1) Проверяем last_sqls в обратном порядке
         for sql in reversed(state.last_sqls):
-            m = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', sql, re.IGNORECASE)
-            if m:
-                tbl = m.group(1).split(".")[-1]
-                if tbl.lower() not in {"information_schema", "sqlite_master"}:
-                    return tbl
+            found = _extract(sql)
+            if found:
+                return found
 
         # 2) Ищем в истории
         for msg in reversed(state.history):
-            content = str(msg.get("content", ""))
-
-            # Явное упоминание FROM в любом сообщении
-            m = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', content, re.IGNORECASE)
-            if m:
-                tbl = m.group(1).split(".")[-1]
-                if tbl.lower() not in {"information_schema", "sqlite_master"}:
-                    return tbl
+            found = _extract(str(msg.get("content", "")))
+            if found:
+                return found
 
         return None
 
@@ -603,9 +655,12 @@ class RepdixEngine:
 
     # ---------- Схема БД (RAG) ----------
     async def _get_db_schema(self, state: SessionState) -> str:
-        """Формирует схему БД ТОЛЬКО из разрешённых таблиц и полей.
+        """Формирует схему БД ТОЛЬКО из разрешённых схем, таблиц и полей.
 
-        Для админа показывает все таблицы с полями (не только список, как было).
+        Multi-schema: таблицы выводятся как fully-qualified (schema.table).
+        Схемы фильтруются через rbac.get_allowed_schemas(), таблицы — через
+        rbac.get_allowed_tables(). Для admin разрешены все схемы из
+        db_manager.get_schemas().
         """
         if state.current_db is None or self.db_manager is None:
             return ""
@@ -614,118 +669,133 @@ class RepdixEngine:
         logger.debug("RBAC: user_roles для %s: %s", state.user_id, user_roles)
 
         default_schema = self._get_default_schema(state)
+        is_admin = "admin" in user_roles
 
-        # 1) Получаем реальный список таблиц из БД (один раз)
+        # 1) Схемы текущей БД
+        try:
+            schemas = await self.db_manager.get_schemas(state.current_db)
+        except Exception as e:
+            logger.error("Ошибка получения схем из БД: %s", e)
+            return ""
+
+        if is_admin:
+            allowed_schemas: set[str] = set(schemas)
+            allowed_tables_marker: set[str] = {"*"}
+            rules: dict[str, dict] = {}
+        else:
+            allowed_schemas = self.rbac.get_allowed_schemas(
+                user_roles, schemas, default_schema,
+            )
+            allowed_tables_marker = self.rbac.get_allowed_tables(
+                user_roles, schemas, default_schema,
+            )
+            self.rbac._load_config()
+            rules = self.rbac._collect_rules(user_roles)
+
+        wildcard_tables = "*" in allowed_tables_marker
+        if not allowed_schemas and not wildcard_tables:
+            return "У вас нет доступа ни к одной таблице."
+
+        # 2) Реальный список таблиц (fully-qualified: schema.table)
         try:
             all_tables = await self.db_manager.get_table_list(state.current_db)
         except Exception as e:
             logger.error("Ошибка получения таблиц из БД: %s", e)
             return ""
 
-        # 2) Админ: все таблицы + все поля
-        if "admin" in user_roles:
-            lines = [f"Доступные таблицы и поля (схема: {default_schema}, роль: admin):"]
-            for t in all_tables:
-                lines.append(f"\nТаблица: {default_schema}.{t}")
-                try:
-                    cols = await self.db_manager.get_table_schema(state.current_db, t)
-                except Exception:
-                    cols = []
-                for col in cols:
-                    c_name = col.get("column_name", "")
-                    c_type = col.get("data_type", "")
-                    c_comm = col.get("column_comment", "")
-                    if c_comm:
-                        lines.append(f"  - {c_name} ({c_type}): {c_comm}")
-                    else:
-                        lines.append(f"  - {c_name} ({c_type})")
-            # Связи (без фильтра — админ видит всё)
-            relations_text = self._get_relations_text(allowed_tables=None)
-            if relations_text:
-                lines.append("")
-                lines.append(relations_text)
-            return "\n".join(lines)
-
-        # 3) Обычные пользователи: собираем правила из RBAC
-        self.rbac._load_config()
-
-        allowed_tables_rules: dict[str, dict] = {}
-        for role in user_roles:
-            role_data = self.rbac._config.get(role, {})
-            for tbl_key, rules in (role_data.get("tables", {}) or {}).items():
-                if "." in tbl_key:
-                    allowed_tables_rules[tbl_key.lower()] = rules
-                elif tbl_key == "*":
-                    # Wildcard на уровне таблиц: для всех таблиц default_schema
-                    allowed_tables_rules[f"{default_schema}.*"] = rules
-                else:
-                    allowed_tables_rules[f"{default_schema}.{tbl_key}".lower()] = rules
-
-        if not allowed_tables_rules:
-            return "У вас нет доступа ни к одной таблице."
-
-        # 4) Формируем текст
-        lines = [f"Доступные таблицы и поля (схема: {default_schema}):"]
-        found_any = False
-
-        for full_name, rules in allowed_tables_rules.items():
-            # Wildcard на уровне таблиц: разворачиваем во все таблицы
-            if full_name.endswith(".*"):
-                schema_part = full_name.rsplit(".", 1)[0]
-                for t in all_tables:
-                    lines.extend(await self._describe_table(
-                        state, t, schema_part, rules, all_tables
-                    ))
-                    found_any = True
+        # 3) Фильтрация по схемам и RBAC-правилам
+        target: list[tuple[str, str, dict | None]] = []
+        for full_name in all_tables:
+            sch, tbl = self._split_qualified(full_name, default_schema)
+            if sch not in allowed_schemas:
                 continue
+            if wildcard_tables:
+                table_rules = None if is_admin else self.rbac._match_table_rule(
+                    tbl, sch, rules,
+                )
+                target.append((sch, tbl, table_rules))
+                continue
+            if f"{sch}.{tbl}".lower() in allowed_tables_marker:
+                table_rules = self.rbac._match_table_rule(tbl, sch, rules)
+                target.append((sch, tbl, table_rules))
 
-            schema_part, tbl_part = full_name.split(".", 1) if "." in full_name else (default_schema, full_name)
-            lines.extend(await self._describe_table(
-                state, tbl_part, schema_part, rules, all_tables
-            ))
-            found_any = True
-
-        if not found_any:
+        if not target:
             return "В RBAC разрешены таблицы, но в БД их нет."
 
-        relations_text = self._get_relations_text(allowed_tables=list(allowed_tables_rules.keys()))
+        # 4) Текст для промпта
+        schemas_str = ", ".join(sorted(allowed_schemas)) or "—"
+        lines = [
+            f"Доступные схемы: {schemas_str}. "
+            f"Схема по умолчанию: {default_schema or '—'}."
+        ]
+
+        for sch, tbl, table_rules in target:
+            lines.extend(
+                await self._describe_table(state, sch, tbl, table_rules, all_tables)
+            )
+
+        relations_text = self._get_relations_text(
+            allowed_tables=[f"{s}.{t}" for s, t, _ in target]
+        )
         if relations_text:
             lines.append("")
             lines.append(relations_text)
 
         return "\n".join(lines)
 
-    async def _describe_table(self, state: SessionState, tbl_part: str,
-                               schema_part: str, rules: dict,
+    async def _describe_table(self, state: SessionState, schema: str, table: str,
+                               rules: dict | None,
                                all_tables: list[str]) -> list[str]:
-        """Возвращает строки описания одной таблицы (для _get_db_schema)."""
+        """Возвращает строки описания одной таблицы (для _get_db_schema).
+
+        Args:
+            state: Состояние сессии.
+            schema: Имя схемы.
+            table: Короткое имя таблицы.
+            rules: Правило из rbac._collect_rules()
+                ({"allowed": set, "excluded": set, "has_wildcard": bool})
+                или None — поля не фильтруются по RBAC.
+            all_tables: Полный список fully-qualified таблиц (проверка
+                существования).
+        """
         result: list[str] = []
 
-        real_name = next((t for t in all_tables if t.lower() == tbl_part.lower()), None)
+        real_name = None
+        for full_name in all_tables:
+            sch, tbl = self._split_qualified(full_name, schema)
+            if sch == schema and tbl.lower() == table.lower():
+                real_name = tbl
+                break
+
         if not real_name:
-            logger.warning("RBAC: таблица '%s' не найдена в БД", tbl_part)
+            logger.warning("RBAC: таблица '%s.%s' не найдена в БД", schema, table)
             return result
 
-        result.append(f"\nТаблица: {schema_part}.{real_name}")
+        title = f"{schema}.{real_name}" if schema else real_name
+        result.append(f"\nТаблица: {title}")
+
         try:
-            real_columns = await self.db_manager.get_table_schema(state.current_db, real_name)
+            real_columns = await self.db_manager.get_table_schema(
+                state.current_db, real_name, schema or None,
+            )
         except Exception as e:
             logger.error("Ошибка получения колонок для %s: %s", real_name, e)
             return result
 
-        allowed = rules.get("allowed_columns", [])
-        excluded = rules.get("excluded_columns", [])
+        allowed: set[str] = (rules or {}).get("allowed", set()) or set()
+        excluded: set[str] = (rules or {}).get("excluded", set()) or set()
+        has_wildcard = bool((rules or {}).get("has_wildcard"))
 
         for col in real_columns:
             c_name = col.get("column_name", "")
             c_type = col.get("data_type", "")
             c_comm = col.get("column_comment", "")
+            c_lower = str(c_name).lower()
 
-            if c_name in excluded:
+            if c_lower in excluded:
                 continue
-            if allowed and allowed != "*" and isinstance(allowed, list):
-                if c_name not in allowed:
-                    continue
+            if rules is not None and not has_wildcard and c_lower not in allowed:
+                continue
 
             if c_comm:
                 result.append(f"  - {c_name} ({c_type}): {c_comm}")
@@ -877,7 +947,6 @@ class RepdixEngine:
                 state.last_model_used = "algorithm (command)"
                 active_model_display = state.current_model or f"авто-выбор (роутер: {self.tool_model} / {self.analysis_model})"
                 lines = [
-                    f"Текущая БД: {state.current_db or 'не выбрана'}",
                     f"Активная модель: {active_model_display}",
                     f"Лимит истории: {self.max_history}",
                 ]
@@ -888,8 +957,48 @@ class RepdixEngine:
                 else:
                     lines.append("Лимит контекста: недоступен")
                 if self.db_manager is not None:
+                    lines.append("Доступные БД:")
                     db_names = self.db_manager.get_db_names()
-                    lines.append(f"Доступные БД: {', '.join(db_names) if db_names else 'нет'}")
+                    if db_names:
+                        for n in db_names:
+                            lines.append(
+                                f"  • {self.db_manager.get_db_display_name(n)}"
+                            )
+                    else:
+                        lines.append("  (нет)")
+
+                    if state.current_db:
+                        lines.append(
+                            "Текущая БД: "
+                            + self.db_manager.get_db_display_name(state.current_db)
+                        )
+                        settings_default_schema = self._get_default_schema(state)
+                        settings_roles = (
+                            self.user_manager.get_user_roles(state.user_id)
+                            if self.user_manager else []
+                        )
+                        try:
+                            settings_schemas = await self.db_manager.get_schemas(
+                                state.current_db
+                            )
+                        except Exception:
+                            settings_schemas = []
+                        if "admin" in settings_roles:
+                            settings_allowed = set(settings_schemas)
+                        else:
+                            settings_allowed = self.rbac.get_allowed_schemas(
+                                settings_roles,
+                                settings_schemas,
+                                settings_default_schema,
+                            )
+                        lines.append(
+                            "Доступные схемы: "
+                            + (", ".join(sorted(settings_allowed)) or "—")
+                        )
+                        lines.append(
+                            "Схема по умолчанию: "
+                            + (settings_default_schema or "—")
+                        )
                 else:
                     lines.append("Доступные БД: нет")
                 if self.llm_client is not None:
@@ -913,11 +1022,18 @@ class RepdixEngine:
                 db_name = text[4:].strip()
                 available = self.db_manager.get_db_names() if self.db_manager is not None else []
                 if db_name not in available:
-                    audit_answer = f"БД '{db_name}' не найдена. Доступные: {', '.join(available) if available else 'нет'}"
+                    lines = [f"БД '{db_name}' не найдена.", "", "Доступные БД:"]
+                    for n in available:
+                        lines.append(f"  • {self.db_manager.get_db_display_name(n)}")
+                    audit_answer = "\n".join(lines)
                 else:
                     state.current_db = db_name
                     default_schema = self._get_default_schema(state)
-                    audit_answer = f"БД: {state.current_db} (схема: {default_schema or '—'})"
+                    display = self.db_manager.get_db_display_name(state.current_db)
+                    audit_answer = (
+                        f"БД: {display} "
+                        f"(схема по умолчанию: {default_schema or '—'})"
+                    )
                 if self.show_model_in_response:
                     audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                 self._log_audit(state, msg, audit_question, audit_answer)
@@ -925,7 +1041,26 @@ class RepdixEngine:
 
             if text == "/db":
                 state.last_model_used = "algorithm (command)"
-                audit_answer = f"Текущая БД: {state.current_db}"
+                lines: list[str] = []
+                if state.current_db and self.db_manager is not None:
+                    lines.append(
+                        "Текущая БД: "
+                        + self.db_manager.get_db_display_name(state.current_db)
+                    )
+                elif state.current_db:
+                    lines.append(f"Текущая БД: {state.current_db}")
+                else:
+                    lines.append("Текущая БД: не выбрана")
+                if self.db_manager is not None:
+                    names = self.db_manager.get_db_names()
+                    if names:
+                        lines.append("")
+                        lines.append("Доступные БД:")
+                        for n in names:
+                            lines.append(
+                                f"  • {self.db_manager.get_db_display_name(n)}"
+                            )
+                audit_answer = "\n".join(lines)
                 if self.show_model_in_response:
                     audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                 self._log_audit(state, msg, audit_question, audit_answer)
@@ -1023,8 +1158,12 @@ class RepdixEngine:
                     duration = time.perf_counter() - start_time
                     if rows is None:
                         rows = []
-                    tbl = self._extract_table_from_sql(sql)
-                    audit_answer = await self._format_sql_result(rows, db_name=state.current_db, table_name=tbl)
+                    extracted = self._extract_table_from_sql(sql)
+                    schema_part, table_part = extracted if extracted else (None, None)
+                    audit_answer = await self._format_sql_result(
+                        rows, db_name=state.current_db,
+                        schema=schema_part, table_name=table_part,
+                    )
                     self._log_sql_audit(sql, duration, "success", source="manual")
                     if self.show_model_in_response:
                         audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -1096,7 +1235,19 @@ class RepdixEngine:
                 state.last_model_used = model_to_use
 
                 db_type = self._get_db_type(state)
-                base_prompt = _build_base_prompt(db_type)
+                prompt_default_schema = self._get_default_schema(state)
+                if self.db_manager is not None and state.current_db is not None:
+                    try:
+                        prompt_schemas = await self.db_manager.get_schemas(
+                            state.current_db
+                        )
+                    except Exception:
+                        prompt_schemas = []
+                else:
+                    prompt_schemas = []
+                base_prompt = _build_base_prompt(
+                    db_type, prompt_schemas, prompt_default_schema,
+                )
                 schema = await self._get_db_schema(state)
                 _now = datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
                 system_content = (
@@ -1326,9 +1477,13 @@ class RepdixEngine:
                             duration = time.perf_counter() - start_time
                             if rows is None:
                                 rows = []
-                            tbl = self._extract_table_from_sql(sql)
+                            extracted = self._extract_table_from_sql(sql)
+                            schema_part, table_part = (
+                                extracted if extracted else (None, None)
+                            )
                             result_text = await self._format_sql_result(
-                                rows, db_name=state.current_db, table_name=tbl
+                                rows, db_name=state.current_db,
+                                schema=schema_part, table_name=table_part,
                             )
                             messages.append({
                                 "role": "tool",

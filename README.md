@@ -33,6 +33,7 @@ repdix/
 │   │   ├── llm_client.py       # клиент LLM (hot-reload models.yaml, temperature из конфига, fallback tools)
 │   │   ├── cache_manager.py    # Redis (история диалогов, graceful degradation)
 │   │   ├── rbac_guard.py       # проверка прав доступа к таблицам и полям (sqlglot AST)
+│   │   ├── technical_filter.py # фильтрация технических таблиц/колонок (TECHNICAL_PREFIXES)
 │   │   └── validator.py        # SQL-валидатор (только SELECT/WITH, forbidden keywords, комментарии)
 │   └── interfaces/             # адаптеры мессенджеров
 │       ├── __init__.py
@@ -165,6 +166,7 @@ MAX_ROWS_IN_RESPONSE=100
 MAX_MESSAGE_LENGTH=4000
 SESSION_TTL_SEC=86400       # 24 часа
 SHOW_MODEL_IN_RESPONSE=false
+SCHEMA_CACHE_TTL_SEC=3600       # TTL кэша схемы БД (сек)
 
 # Скрытые (технические) таблицы/колонки
 TECHNICAL_PREFIXES=technical_       # CSV-префиксы скрытых таблиц/колонок
@@ -208,6 +210,9 @@ databases:
     user: ${DB_MAIN_USER}
     password: ${DB_MAIN_PASSWORD}
     database: db_itzamna
+    schemas: auto           # или явный список: [db_itzamna, db_itzamna_archive]
+    exclude_schemas: [mysql, information_schema, performance_schema, sys]
+    description: "Основная БД"
     readonly: true
     is_mariadb: false       # true, если СУБД — MariaDB (отключает MAX_EXECUTION_TIME)
     charset: utf8mb4
@@ -228,6 +233,7 @@ databases:
 - **SQLite-комментарии без пробела:** `_strip_comments_for_check` в `validator.py` вырезает `--` только если после него есть пробел (или это начало строки). SQLite допускает `--no space` как комментарий — такие случаи могут дать ложноположительное срабатывание forbidden keywords. Редкий сценарий.
 - **`SELECT *` + `excluded_columns`:** RBAC запрещает `SELECT *`, если у таблицы есть скрытые поля. Модели нужно явно перечислять разрешённые поля.
 - **Технические таблицы/колонки:** имена, начинающиеся с префиксов из `TECHNICAL_PREFIXES` (по умолчанию `technical_`), полностью скрыты от всех пользователей (включая админов): не попадают в промпт LLM, блокируются RBAC-гардом до применения правил из `roles.yaml`, вырезаются из результатов запросов, шаблонов и связей. Настраивается через env.
+- **Multi-schema:** одна MySQL-БД может содержать несколько схем. Список задаётся в `databases.yaml` (`schemas: auto` или явный список), исключения — `exclude_schemas`. Результат кэшируется на `SCHEMA_CACHE_TTL_SEC` (по умолчанию 3600 сек). Таблицы в промпте и в `get_table_list()` возвращаются fully-qualified (`schema.table`); `get_table_schema()` принимает `(db, table, schema)`. Схемы с техническими префиксами (`technical_*`) скрыты полностью — не попадают ни в промпт, ни в RBAC-проверки, ни в результаты.
 - **Контекст LLM:** при переполнении (> 80% лимита) история обрезается до 2 последних сообщений, при повторном переполнении — ошибка с просьбой использовать `/compact` или `/clear`.
 - **Hot-reload:** `models.yaml`, `databases.yaml`, `roles.yaml`, `users.yaml`, `relations.yaml`, `templates.yaml`, `help.md` перечитываются автоматически при изменении mtime (кроме `databases.yaml` — пулы соединений создаются один раз при старте).
 - **Файлы конфигурации:** `config/users.yaml` содержит персональные данные (ФИО). **Обязательно** добавьте `config/users.yaml`, `.env` и `logs/` в `.gitignore`, чтобы не закоммитить их в публичный репозиторий.

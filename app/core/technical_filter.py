@@ -1,5 +1,5 @@
 # app/core/technical_filter.py
-# dv_file_version = '261029.04'
+dv_file_version = '261029.05'
 
 import os
 import re
@@ -30,4 +30,7 @@ def is_technical_qualified(name: str) -> bool:
     """
     if not name:
         return False
-    return any(is_technical(part) for part in str(name).split("."))
+    raw = str(name)
+    if is_technical(raw):
+        return True
+    return any(is_technical(part) for part in raw.split("."))

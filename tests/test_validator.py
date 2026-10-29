@@ -67,12 +67,11 @@ def test_empty_rejected():
     assert ok is False
 
 
-def test_delete_in_comment_is_known_false_positive():
-    # ИЗВЕСТНОЕ ограничение: DELETE в комментарии вызывает ложное срабатывание.
-    # Это безопасно (лишний отказ), но нежелательно. Тест фиксирует ТЕКУЩЕЕ поведение,
-    # а не требование. Если валидатор научится игнорировать комментарии — тест обновить.
+def test_delete_in_comment_is_ignored():
+    # Комментарии игнорируются при проверке forbidden keywords:
+    # DELETE внутри комментария не вызывает отказа.
     ok, _ = validate_sql("SELECT 1 /* DELETE */")
-    assert ok is False
+    assert ok is True
 
 
 def test_select_with_semicolon_ok():

@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261029.03'
+dv_file_version = '261029.06'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -147,15 +147,82 @@ class RBACGuard:
 
         return "\n".join(lines)
 
-    def get_allowed_tables(self, user_roles: list[str]) -> list[str]:
-        """Возвращает список разрешённых таблиц (в нижнем регистре).
+    def get_allowed_tables(
+        self,
+        user_roles: list[str],
+        schemas: list[str],
+        default_schema: str = "",
+    ) -> set[str]:
+        """Возвращает множество разрешённых таблиц (в нижнем регистре).
 
-        Для правила "*" возвращает ["*"]. Для qualified-ключей возвращает
-        полное имя "schema.table".
+        Qualified-ключи ("schema.table") возвращаются как есть. Короткие
+        ключи нормализуются к "<default_schema>.<key>". Маркер wildcard
+        возвращается как {"*"} — вызывающий код сам разворачивает его во все
+        схемы из schemas.
+
+        Args:
+            user_roles: Роли пользователя.
+            schemas: Список доступных схем (для документации; wildcard
+                разворачивает вызывающий код).
+            default_schema: Схема для коротких ключей.
         """
         self._load_config()
         rules = self._collect_rules(user_roles)
-        return list(rules.keys())
+        result: set[str] = set()
+        default_schema_l = (default_schema or "").strip().lower()
+
+        for key in rules:
+            k = str(key).strip().lower()
+            if not k:
+                continue
+            if k == "*":
+                result.add("*")
+            elif "." in k:
+                result.add(k)
+            elif default_schema_l:
+                result.add(f"{default_schema_l}.{k}")
+            else:
+                result.add(k)
+
+        return result
+
+    def get_allowed_schemas(
+        self,
+        user_roles: list[str],
+        available_schemas: list[str],
+        default_schema: str = "",
+    ) -> set[str]:
+        """Возвращает множество схем, к которым у ролей есть доступ.
+
+        - wildcard-правило "*" — доступны все available_schemas;
+        - qualified-ключ "schema.table" — доступна schema, если она есть
+          в available_schemas;
+        - короткий ключ — доступна default_schema (если она есть в списке).
+        """
+        self._load_config()
+        rules = self._collect_rules(user_roles)
+        available_l = {
+            str(s).strip().lower() for s in (available_schemas or []) if s
+        }
+
+        if "*" in rules:
+            return set(available_l)
+
+        default_schema_l = (default_schema or "").strip().lower()
+        result: set[str] = set()
+
+        for key in rules:
+            k = str(key).strip().lower()
+            if not k or k == "*":
+                continue
+            if "." in k:
+                schema_part = k.split(".", 1)[0].strip()
+                if schema_part in available_l:
+                    result.add(schema_part)
+            elif default_schema_l and default_schema_l in available_l:
+                result.add(default_schema_l)
+
+        return result
 
     # ------------------------------------------------------------------
     # Основная валидация SQL
