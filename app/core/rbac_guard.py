@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261028.01'
+dv_file_version = '261029.03'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -11,6 +11,8 @@ dv_file_version = '261028.01'
    поля утекли бы через звёздочку. Требуем явного перечисления полей.
 4. sqlglot (диалект mysql) — единственный парсер. Регексп-эвристики убраны:
    они дублировали sqlglot и создавали обходы.
+5. Технические таблицы/колонки (префиксы из TECHNICAL_PREFIXES) блокируются
+   до проверки RBAC-правил.
 """
 
 import logging
@@ -20,16 +22,23 @@ import sqlglot
 import yaml
 from sqlglot import exp
 
+from app.core.technical_filter import is_technical_qualified
+
 logger = logging.getLogger(__name__)
 
 
 class RBACGuard:
     """Проверяет SQL-запросы на соответствие ролям из config/roles.yaml."""
 
-    def __init__(self, roles_config_path: str = "config/roles.yaml"):
+    def __init__(
+        self,
+        roles_config_path: str = "config/roles.yaml",
+        technical_columns_getter=None,
+    ):
         self.roles_config_path = roles_config_path
         self._config: dict = {}
         self._mtime: float = 0.0
+        self._technical_columns_getter = technical_columns_getter
 
     # ------------------------------------------------------------------
     # Загрузка конфига (hot-reload)
@@ -168,6 +177,72 @@ class RBACGuard:
             (True, sql) — если запрос разрешён.
             (False, reason) — если запрещён.
         """
+        # Парсинг — ДО RBAC-правил: технические объекты должны блокироваться
+        # раньше, чем сработает wildcard-правило "*" (роль admin).
+        try:
+            parsed = sqlglot.parse_one(sql, read="mysql")
+        except Exception as e:
+            return False, f"Ошибка парсинга SQL: {e}"
+
+        if parsed is None:
+            return False, "Пустой SQL-запрос."
+
+        # ------------------------------------------------------------------
+        # 0. Технические таблицы/колонки — блокируем ДО проверки RBAC.
+        #    Иначе правило "*" (admin) открыло бы их.
+        # ------------------------------------------------------------------
+        for table in parsed.find_all(exp.Table):
+            qualified_name = self._table_qualified_name(table)
+            if not qualified_name:
+                continue
+            # Проверяем и schema, и table часть: schema.technical_x,
+            # technical_schema.t и т.п. тоже должны блокироваться.
+            if is_technical_qualified(qualified_name):
+                return False, f"technical table access denied: {qualified_name}"
+
+        for column in parsed.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+            col_name = (column.name or "").lower()
+            if not col_name:
+                continue
+            # Если колонка квалифицирована (alias.col / schema.table.col),
+            # проверяем и полное имя, и часть после последней точки.
+            qualified_col = (
+                f"{column.table.name}.{col_name}".lower()
+                if column.table
+                else col_name
+            )
+            if is_technical_qualified(qualified_col):
+                return False, f"technical column access denied: {col_name}"
+
+        # SELECT * по таблице с техническими колонками — запрещён.
+        # getter синхронный; в engine передаётся None (db_manager асинхронный),
+        # реальная страховка — пост-фильтрация результата в engine.
+        if self._technical_columns_getter is not None and any(parsed.find_all(exp.Star)):
+            queried_tables = {
+                self._table_qualified_name(t)
+                for t in parsed.find_all(exp.Table)
+                if t.name
+            }
+            for qualified_tbl in queried_tables:
+                short_tbl = qualified_tbl.split(".")[-1]
+                tech_cols: set[str] = set()
+                # Getter может ожидать как qualified-, так и короткое имя —
+                # опрашиваем оба варианта.
+                for candidate in {qualified_tbl, short_tbl}:
+                    try:
+                        result = self._technical_columns_getter(candidate)
+                    except Exception:
+                        result = None
+                    if result:
+                        tech_cols.update(result)
+                if tech_cols:
+                    return (
+                        False,
+                        f"SELECT * forbidden: table {short_tbl} has technical columns",
+                    )
+
         self._load_config()
         rules = self._collect_rules(user_roles)
 
@@ -178,15 +253,6 @@ class RBACGuard:
             "RBAC validate: user_roles=%s, rules=%s, default_schema=%s",
             user_roles, list(rules.keys()), default_schema,
         )
-
-        # Парсинг
-        try:
-            parsed = sqlglot.parse_one(sql, read="mysql")
-        except Exception as e:
-            return False, f"Ошибка парсинга SQL: {e}"
-
-        if parsed is None:
-            return False, "Пустой SQL-запрос."
 
         default_schema_l = (default_schema or "").strip().lower()
 
@@ -335,6 +401,22 @@ class RBACGuard:
                 )
 
         return True, sql
+
+    # ------------------------------------------------------------------
+    # Нормализация имени таблицы
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _table_qualified_name(table: exp.Table) -> str:
+        """Возвращает schema.table (lowercase) или короткое имя, если схемы нет."""
+        tbl_name = (table.name or "").lower()
+        raw_db = table.db
+        if isinstance(raw_db, exp.Identifier):
+            schema_name = (raw_db.name or "").lower()
+        elif isinstance(raw_db, str):
+            schema_name = raw_db.lower()
+        else:
+            schema_name = ""
+        return f"{schema_name}.{tbl_name}" if schema_name else tbl_name
 
     # ------------------------------------------------------------------
     # Поиск правила для таблицы

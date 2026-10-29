@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261028.02'
+dv_file_version = '261029.05'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
 
 Ключевые изменения версии 261027.02:
@@ -38,6 +38,7 @@ from datetime import datetime
 import yaml
 
 from app.core.session import SessionState, SessionStore
+from app.core.technical_filter import is_technical, is_technical_qualified
 from app.core.validator import log_violation, validate_sql
 from app.core.rbac_guard import RBACGuard
 from app.interfaces.base import ChatMessage, ChatResponse
@@ -192,6 +193,10 @@ def _build_base_prompt(db_type: str) -> str:
         "- В статусах (перед вызовом инструмента) пиши ОДНО короткое предложение (до 7 слов).\n"
         "- Если пользователь просит показать данные — выводи ТОЛЬКО данные.\n"
         "- Не выводи Markdown-таблицы с '|'. Используй списки и абзацы.\n\n"
+        "КАТЕГОРИЧЕСКОЕ ПРАВИЛО ПО ОТКАЗАМ: Если инструмент вернул сообщение, "
+        "начинающееся с '⛔ Доступ запрещен', ты ОБЯЗАН сообщить пользователю "
+        "причину отказа из этого сообщения. НЕ придумывай результат, НЕ пиши "
+        "'Результат: пусто' и НЕ пытайся обойти запрет другими запросами.\n\n"
         "КРИТИЧЕСКОЕ ПРАВИЛО: Ты ОБЯЗАН перед КАЖДЫМ вызовом инструмента написать "
         "пользователю краткий комментарий о том, что ты собираешься сделать. "
         "Например: 'Сейчас посмотрю структуру таблицы...', 'Выполню запрос для группировки по дням...'. "
@@ -218,7 +223,11 @@ class RepdixEngine:
         self.cache_manager = cache_manager
         self.default_db = default_db
         self.user_manager = user_manager
-        self.rbac = RBACGuard()
+        # technical_columns_getter=None: RBACGuard.validate_sql синхронный,
+        # а db_manager асинхронный — реализовать getter без блокировки нельзя.
+        # Защита SELECT * по техническим колонкам дополнительно выполняется
+        # фильтрацией результата в _format_sql_result().
+        self.rbac = RBACGuard(technical_columns_getter=None)
         self.sessions = SessionStore(default_db=default_db)
         self.max_history = 10
         self.tool_model = "tool_calling_model"
@@ -234,17 +243,25 @@ class RepdixEngine:
         Для MySQL — имя базы (database), для PostgreSQL — database (обычно
         public, но может быть переопределён), для SQLite — "".
         """
-        fallback = "public"
         if not self.db_manager or not state.current_db:
-            return fallback
+            return "public"
         try:
             db_conf = self.db_manager.get_db_config(state.current_db)
         except Exception:
-            return fallback
+            return "public"
         db_type = (db_conf.get('type') or '').lower()
         if db_type == 'sqlite':
+            # В SQLite схем нет; пустая строка не ломает техническую проверку:
+            # is_technical_qualified() ловит короткое имя таблицы без схемы.
             return ""
-        return (db_conf.get('database') or fallback).lower()
+        db_name = (db_conf.get('database') or '').strip()
+        if db_name:
+            return db_name.lower()
+        # Fallback: для MySQL схема совпадает с именем БД/подключения,
+        # для PostgreSQL по умолчанию public.
+        if db_type == 'mysql':
+            return (state.current_db or '').lower()
+        return "public"
 
     def _get_db_type(self, state: SessionState) -> str:
         """Возвращает тип текущей БД (mysql/postgresql/sqlite)."""
@@ -263,6 +280,26 @@ class RepdixEngine:
         Markdown-таблицы с '|' НЕ используются (противоречило бы промпту).
         Для <5 колонок — вертикальный список, для >=5 — нумерованный список.
         """
+        # Вырезаем технические колонки из результата (защита в глубину:
+        # RBAC-гард блокирует их в SQL, но фильтруем и здесь).
+        filtered_rows: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                filtered_rows.append(row)
+                continue
+            cleaned = {
+                k: v for k, v in row.items()
+                if not is_technical(str(k))
+            }
+            if cleaned:
+                filtered_rows.append(cleaned)
+        if not filtered_rows and rows:
+            # Все колонки оказались техническими: не показываем «пусто»,
+            # это скрытый отказ доступа (защита в глубину после RBAC).
+            return "⛔ Доступ запрещён: результат содержит только технические колонки."
+
+        rows = filtered_rows
+
         if not rows:
             return "Результат: пусто"
 
@@ -419,6 +456,16 @@ class RepdixEngine:
         if not tpl:
             return f"Шаблон '{tpl_name}' не найден."
 
+        # Технические таблицы недоступны даже через шаблоны (иначе admin
+        # через execute_template увидел бы скрытые данные в обход RBAC).
+        tpl_table_raw = str(tpl.get("table") or "")
+        if is_technical(tpl_table_raw):
+            logger.warning(
+                "Шаблон '%s' ссылается на техническую таблицу '%s' — отказ.",
+                tpl_name, tpl_table_raw,
+            )
+            return "Шаблон ссылается на техническую таблицу и недоступен."
+
         # Валидация имён полей/таблиц из шаблона (защита от инъекции через конфиг)
         def _safe_ident(x: str | None, default: str) -> str:
             if not x or not re.fullmatch(r"[a-zA-Z0-9_\.]+", x):
@@ -471,14 +518,18 @@ class RepdixEngine:
             sql += f" LIMIT {final_limit}"
 
         # --- RBAC-проверка (закрываем дыру) ---
+        # Проверка выполняется ВСЕГДА (как в /sql и execute_sql): админ
+        # обходит только обычные RBAC-правила, но не технический фильтр.
         if self.user_manager:
-            user_roles = self.user_manager.get_user_roles(state.user_id)
-            if "admin" not in user_roles:
-                default_schema = self._get_default_schema(state)
-                rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
-                if not rbac_ok:
-                    log_violation(state.user_id, sql, f"RBAC(template): {rbac_msg}")
-                    return f"⛔ Доступ запрещён: {rbac_msg}"
+            user_roles = self.user_manager.get_user_roles(state.user_id) or []
+            default_schema = self._get_default_schema(state)
+            rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
+            technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
+            if not rbac_ok and ("admin" in user_roles) and not technical_denied:
+                logger.info("template: admin bypass for non-technical SQL")
+            elif not rbac_ok:
+                log_violation(state.user_id, sql, f"RBAC(template): {rbac_msg}")
+                return f"⛔ Доступ запрещён: {rbac_msg}"
 
         try:
             rows = await self.db_manager.execute_query(state.current_db, sql)
@@ -519,6 +570,11 @@ class RepdixEngine:
         for table_name, rels in relations.items():
             clean_table_name = table_name.lower()
 
+            # Технические таблицы-источники скрываем целиком.
+            # Проверяем все части имени: техничной может быть schema-часть.
+            if is_technical_qualified(clean_table_name):
+                continue
+
             if allowed_set is not None and clean_table_name not in allowed_set:
                 continue
 
@@ -527,8 +583,15 @@ class RepdixEngine:
                 ref = rel.get("references", "")
                 desc = rel.get("description", "")
 
+                # Технические колонки не раскрываем
+                if is_technical_qualified(col):
+                    continue
+
                 if "." in ref:
                     ref_table = ".".join(ref.split(".")[:-1]).lower()
+                    # Ссылки на технические таблицы/схемы тоже скрываем
+                    if is_technical_qualified(ref_table):
+                        continue
                     if allowed_set is not None and ref_table not in allowed_set:
                         continue
 
@@ -922,17 +985,29 @@ class RepdixEngine:
                     self._log_audit(state, msg, audit_question, audit_answer)
                     return ChatResponse(text=audit_answer)
 
-                # RBAC
+                # RBAC + технический фильтр.
+                # ВАЖНО: проверка выполняется и для админов — иначе технические
+                # таблицы/колонки доступны в обход RBAC (и вместо отказа виден
+                # "Результат: пусто"). Админ обходит только обычные RBAC-правила.
                 if self.user_manager:
-                    user_roles = self.user_manager.get_user_roles(user_id)
-                    if "admin" not in user_roles:
-                        default_schema = self._get_default_schema(state)
-                        rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
-                        if not rbac_ok:
-                            log_violation(user_id, sql, f"RBAC: {rbac_msg}")
-                            audit_answer = f"⛔ Доступ запрещен: {rbac_msg}"
-                            self._log_audit(state, msg, audit_question, audit_answer)
-                            return ChatResponse(text=audit_answer)
+                    user_roles = self.user_manager.get_user_roles(user_id) or []
+                    default_schema = self._get_default_schema(state)
+                    logger.info(
+                        "/sql: user_roles=%s, default_schema=%r, sql=%r",
+                        user_roles, default_schema, sql,
+                    )
+                    rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
+                    technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
+                    if not rbac_ok and ("admin" in user_roles) and not technical_denied:
+                        logger.info("/sql: admin bypass for non-technical SQL")
+                    elif not rbac_ok:
+                        log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
+                        audit_answer = f"⛔ Доступ запрещен: {rbac_msg}"
+                        if self.show_model_in_response:
+                            audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                        self._log_audit(state, msg, audit_question, audit_answer)
+                        return ChatResponse(text=audit_answer)
+                    else:
                         sql = rbac_msg
 
                 if state.current_db is None:
@@ -1204,19 +1279,30 @@ class RepdixEngine:
                             })
                             continue
 
-                        # RBAC
+                        # RBAC + технический фильтр (админы тоже проверяются:
+                        # технические таблицы/колонки запрещены всем ролям).
                         if self.user_manager:
-                            user_roles = self.user_manager.get_user_roles(user_id)
-                            if "admin" not in user_roles:
-                                rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
-                                if not rbac_ok:
-                                    log_violation(user_id, sql, f"RBAC: {rbac_msg}")
-                                    messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call["id"],
-                                        "content": f"⛔ Доступ запрещен: {rbac_msg}",
-                                    })
-                                    continue
+                            user_roles = self.user_manager.get_user_roles(user_id) or []
+                            logger.info(
+                                "tool_call execute_sql: user_roles=%s, default_schema=%r, sql=%r",
+                                user_roles, default_schema, sql,
+                            )
+                            rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
+                            technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
+                            if not rbac_ok and ("admin" in user_roles) and not technical_denied:
+                                logger.info("tool_call: admin bypass for non-technical SQL")
+                            elif not rbac_ok:
+                                log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "content": (
+                                        f"⛔ Доступ запрещен: {rbac_msg}. "
+                                        "Сообщи пользователю причину отказа и НЕ придумывай результат."
+                                    ),
+                                })
+                                continue
+                            else:
                                 sql = rbac_msg
 
                         if state.current_db is None:

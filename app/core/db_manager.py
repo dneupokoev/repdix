@@ -1,5 +1,5 @@
 # app/core/db_manager.py
-dv_file_version = '261028.01'
+dv_file_version = '261029.01'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite).
 
 Ключевые изменения версии 261027.06:
@@ -38,6 +38,8 @@ dv_file_version = '261028.01'
   при отсутствии).
 - close(): если пул уже закрыт — не падаем.
 - Docstring в шапке вместо заглушки.
+- get_table_list/get_table_schema скрывают технические сущности
+  (см. app/core/technical_filter.py, префиксы из TECHNICAL_PREFIXES).
 """
 
 import asyncio
@@ -50,6 +52,8 @@ import aiosqlite
 import aiomysql
 import asyncpg
 import yaml
+
+from app.core.technical_filter import is_technical
 
 logger = logging.getLogger(__name__)
 
@@ -332,7 +336,7 @@ class DBManager:
                     for row in rows:
                         normalized = {k.lower(): v for k, v in row.items()}
                         tbl = normalized.get("table_name", "")
-                        if tbl:
+                        if tbl and not is_technical(tbl):
                             result.append(tbl)
                     return result
 
@@ -343,7 +347,14 @@ class DBManager:
                     "WHERE table_schema = 'public' "
                     "ORDER BY table_name"
                 )
-            return [row['table_name'] for row in rows] if rows else []
+            return (
+                [
+                    row['table_name']
+                    for row in rows
+                    if not is_technical(row['table_name'])
+                ]
+                if rows else []
+            )
 
         elif db_type == 'sqlite':
             cursor = await pool.execute(
@@ -353,7 +364,10 @@ class DBManager:
             )
             rows = await cursor.fetchall()
             await cursor.close()
-            return [row[0] for row in rows] if rows else []
+            return (
+                [row[0] for row in rows if not is_technical(row[0])]
+                if rows else []
+            )
 
         else:
             raise NotImplementedError(f"db type {db_type} not supported yet")
@@ -389,8 +403,11 @@ class DBManager:
                     result = []
                     for row in rows:
                         normalized = {k.lower(): v for k, v in row.items()}
+                        col_name = normalized.get("column_name", "")
+                        if is_technical(col_name):
+                            continue
                         result.append({
-                            "column_name": normalized.get("column_name", ""),
+                            "column_name": col_name,
                             "data_type": normalized.get("data_type", ""),
                             "column_comment": normalized.get("column_comment", "") or "",
                         })
@@ -410,7 +427,14 @@ class DBManager:
                     "ORDER BY c.ordinal_position",
                     table_name
                 )
-            return [dict(row) for row in rows] if rows else []
+            return (
+                [
+                    dict(row)
+                    for row in rows
+                    if not is_technical(row["column_name"])
+                ]
+                if rows else []
+            )
 
         elif db_type == 'sqlite':
             if not re.fullmatch(r'[A-Za-z0-9_]+', table_name):
@@ -424,6 +448,7 @@ class DBManager:
             return [
                 {"column_name": row[1], "data_type": row[2], "column_comment": ""}
                 for row in rows
+                if not is_technical(row[1])
             ]
 
         else:
