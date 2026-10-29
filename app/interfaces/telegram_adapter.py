@@ -1,5 +1,5 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261028.07'
+dv_file_version = '261028.08'
 """Telegram-адаптер на aiogram 3.
 
 Ключевые изменения версии 261028.07:
@@ -241,7 +241,7 @@ class TelegramAdapter(BaseChatInterface):
                 logger.warning("Не удалось обновить профиль %s: %s", user_id, e)
 
         if self.user_manager.is_admin(user_id):
-            await message.answer("👑 Привет, Администратор! Бот готов к работе.")
+            await message.answer("👑 Привет, Администратор! AI-аналитик готов к работе.")
             if state is not None:
                 await state.clear()
             return
@@ -259,7 +259,7 @@ class TelegramAdapter(BaseChatInterface):
             return
 
         await message.answer(
-            "👋 Привет! Я корпоративный аналитик. Для доступа к базе данных мне нужно знать, кто вы.\n\n"
+            "👋 Привет! Я AI-аналитик. Для доступа к базе данных мне нужно знать, кто вы.\n\n"
             "Напишите ваше **ФИО**:",
             parse_mode=None,
         )

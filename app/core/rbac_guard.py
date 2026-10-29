@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261029.07'
+dv_file_version = '261029.08'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -298,11 +298,12 @@ class RBACGuard:
                 continue
             # Если колонка квалифицирована (alias.col / schema.table.col),
             # проверяем и полное имя, и часть после последней точки.
-            qualified_col = (
-                f"{column.table.name}.{col_name}".lower()
-                if column.table
-                else col_name
-            )
+            if column.table:
+                raw_tbl = column.table
+                tbl_name = raw_tbl.name if hasattr(raw_tbl, "name") else str(raw_tbl)
+                qualified_col = f"{tbl_name}.{col_name}".lower()
+            else:
+                qualified_col = col_name
             if is_technical_qualified(qualified_col):
                 return False, f"technical column access denied: {col_name}"
 
@@ -398,7 +399,8 @@ class RBACGuard:
             target_rule = None
 
             if isinstance(parent, exp.Column) and parent.table:
-                qual_tbl = (parent.table.name or "").lower()
+                raw_tbl = parent.table
+                qual_tbl = (raw_tbl.name if hasattr(raw_tbl, "name") else str(raw_tbl)).lower()
                 target_rule = table_rule_map.get(qual_tbl)
 
             if target_rule is None:
@@ -434,7 +436,8 @@ class RBACGuard:
             # Определяем, к какой таблице относится колонка
             target_rule = None
             if column.table:
-                qual_tbl = (column.table.name or "").lower()
+                raw_tbl = column.table
+                qual_tbl = (raw_tbl.name if hasattr(raw_tbl, "name") else str(raw_tbl)).lower()
                 target_rule = table_rule_map.get(qual_tbl)
 
             if target_rule is None:

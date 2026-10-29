@@ -1,6 +1,23 @@
 # app/core/engine.py
-dv_file_version = '261029.08'
+dv_file_version = '261029.11'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
+
+Ключевые изменения версии 261029.11:
+- Удалена вторая модель (deep_analysis_model / analysis_model): остаётся
+  только tool_calling_model. _route_query всегда возвращает выбранную
+  пользователем модель или tool_model. Удалены блок "analysis_model: без tools"
+  в process_message, константа ANALYSIS_MARKERS и упоминание в /settings.
+
+Ключевые изменения версии 261029.10:
+- Расширены "ПРАВИЛА АНАЛИЗА" (сравнение с предыдущим периодом, поиск
+  узкого места, указание источника цифр, предупреждение об устаревших
+  данных) и "ПРАВИЛА ВЫВОДА" (блок "Что делать", выделение ключевых
+  цифр, структурные разделы, запрет воды). Структура промпта не менялась.
+
+Ключевые изменения версии 261029.09:
+- Автоматический LIMIT больше не добавляется, если SQL содержит GROUP BY
+  или агрегатную функцию (COUNT/SUM/MIN/MAX/AVG): лимит для агрегатов
+  бессмыслен и только засорял лог.
 
 Ключевые изменения версии 261029.06:
 - Multi-schema: _get_db_schema() фильтрует схемы через
@@ -67,11 +84,6 @@ audit_logger = logging.getLogger("audit")
 TIME_MARKERS = ["когда", "дата", "время", "последние", "последняя", "свежие", "newest", "latest"]
 
 STRUCTURE_MARKERS = ["описание", "поля", "структура", "метаданные"]
-
-ANALYSIS_MARKERS = [
-    "почему", "проанализируй", "сравни", "тренд", "динамика",
-    "причина", "объясни", "прогноз", "статистика", "аналитика",
-]
 
 
 # ----------------------------------------------------------------------
@@ -213,13 +225,35 @@ def _build_base_prompt(
         "Найди разницу.\n"
         "- Затем запроси детализацию по операторам или по дням, чтобы найти аномалии.\n"
         "- Только получив все данные, напиши аналитический вывод: 'Продажи упали на X%. "
-        "Основная причина — падение активности оператора Y (с 10 до 2 продаж).'\n\n"
+        "Основная причина — падение активности оператора Y (с 10 до 2 продаж).'\n"
+        "- СРАВНИВАЙ С ПРЕДЫДУЩИМ ПЕРИОДОМ. Если вопрос про 'за последний месяц/квартал' — "
+        "запроси также данные за предыдущий такой же период и укажи динамику (рост/падение в %). "
+        "Без сравнения ответ неполный.\n"
+        "- ИЩИ УЗКОЕ МЕСТО (bottleneck). Если пользователь спрашивает 'как идут дела' / "
+        "'какой статус' / 'что происходит' — определи, какой этап или группа ограничивает "
+        "процесс (например, 'операторы не успевают', 'судья завис', 'нет новых данных'). "
+        "Назови его явно.\n"
+        "- УКАЗЫВАЙ ИСТОЧНИК КАЖДОЙ КЛЮЧЕВОЙ ЦИФРЫ. Например: '1022 диалога "
+        "(c2t_asr_training_src)' или '201 эталон (approved_review_id IS NOT NULL)'. "
+        "Пользователь должен понимать, откуда взято число.\n"
+        "- ЕСЛИ ДАННЫЕ УСТАРЕЛИ — сообщи об этом. Например: 'последняя сборка 22.09, новых "
+        "данных 5 недель нет'. Это важнее абсолютных цифр.\n\n"
         "ПРАВИЛА ВЫВОДА:\n"
         "- Отвечай МАКСИМАЛЬНО КРАТКО. Только суть, цифры и факты. Никаких вступлений.\n"
         "- Если доступ запрещён или данных нет — пиши ОДНО предложение. НЕ ИЗВИНЯЙСЯ.\n"
         "- В статусах (перед вызовом инструмента) пиши ОДНО короткое предложение (до 7 слов).\n"
         "- Если пользователь просит показать данные — выводи ТОЛЬКО данные.\n"
-        "- Не выводи Markdown-таблицы с '|'. Используй списки и абзацы.\n\n"
+        "- Не выводи Markdown-таблицы с '|'. Используй списки и абзацы.\n"
+        "- В КОНЦЕ ответа — блок 'Что делать' с 1–3 конкретными действиями, "
+        "отсортированными по приоритету (сначала самое важное). Например: '1. Разгрузить 717 "
+        "необработанных диалогов между 3 операторами (сейчас 31 в работе). 2. Прогнать 56 "
+        "диалогов to_judge (висят с сентября). 3. Запустить build_dataset (последний — 22.09).'\n"
+        "- ВЫДЕЛЯЙ КЛЮЧЕВЫЕ ЦИФРЫ жирным (**748 диалогов**, **96% не тронуты**). "
+        "Не выделяй всё подряд — только 3–5 самых важных чисел.\n"
+        "- СТРУКТУРИРУЙ ответ. Для сложных вопросов используй короткие разделы: 'Объём', "
+        "'Работа операторов', 'Судья', 'Вывод'. Для простых — один абзац.\n"
+        "- НЕ ПИШИ ВОДУ. Убирай фразы типа 'как видно из данных', 'стоит отметить', "
+        "'важно понимать'. Сразу к сути.\n\n"
         "КАТЕГОРИЧЕСКОЕ ПРАВИЛО ПО ОТКАЗАМ: Если инструмент вернул сообщение, "
         "начинающееся с '⛔ Доступ запрещен', ты ОБЯЗАН сообщить пользователю "
         "причину отказа из этого сообщения. НЕ придумывай результат, НЕ пиши "
@@ -258,7 +292,6 @@ class RepdixEngine:
         self.sessions = SessionStore(default_db=default_db)
         self.max_history = 10
         self.tool_model = "tool_calling_model"
-        self.analysis_model = "deep_analysis_model"
         self.show_model_in_response = os.environ.get("SHOW_MODEL_IN_RESPONSE", "false").lower() == "true"
         self.max_rows_in_response = int(os.environ.get("MAX_ROWS_IN_RESPONSE") or "100")
         self.max_message_length = int(os.environ.get("MAX_MESSAGE_LENGTH") or "4000")
@@ -414,17 +447,9 @@ class RepdixEngine:
 
     # ---------- Роутинг моделей ----------
     def _route_query(self, text: str, state: SessionState) -> str:
-        """Выбирает модель. analysis_model — только по явным аналитическим маркерам.
-
-        ВАЖНО: длинный вопрос (len>200) больше НЕ отправляется в analysis_model
-        автоматически — иначе модель без tools не сможет выполнить SQL.
-        """
+        """Возвращает выбранную пользователем модель или tool_model по умолчанию."""
         if state.current_model is not None:
             return state.current_model
-
-        text_lower = text.lower()
-        if any(marker in text_lower for marker in ANALYSIS_MARKERS):
-            return self.analysis_model
         return self.tool_model
 
     # ---------- Извлечение имени таблицы из истории ----------
@@ -947,7 +972,7 @@ class RepdixEngine:
             # ---------- /settings ----------
             if text == "/settings":
                 state.last_model_used = "algorithm (command)"
-                active_model_display = state.current_model or f"авто-выбор (роутер: {self.tool_model} / {self.analysis_model})"
+                active_model_display = state.current_model or f"авто-выбор (роутер: {self.tool_model})"
                 lines = [
                     f"Активная модель: {active_model_display}",
                     f"Лимит истории: {self.max_history}",
@@ -1296,22 +1321,6 @@ class RepdixEngine:
                 messages.extend(state.history[-self.max_history:])
                 messages.append({"role": "user", "content": msg.text})
 
-                # analysis_model: без tools
-                if model_to_use == self.analysis_model:
-                    response = await self.llm_client.chat(messages, tools=None, model_name=model_to_use)
-                    choice = response["choices"][0]["message"]
-                    final_text = choice.get("content") or ""
-
-                    await self._save_history(state, user_id, msg.text, final_text)
-
-                    audit_answer = final_text
-                    self._log_audit(state, msg, audit_question, audit_answer)
-
-                    if self.show_model_in_response:
-                        final_text += f"\n\n_Ответ от модели: {state.last_model_used}_"
-
-                    return ChatResponse(text=final_text)
-
                 # ---------- ЦИКЛ АГЕНТА (до 5 шагов) ----------
                 max_steps = 5
                 step = 0
@@ -1466,8 +1475,18 @@ class RepdixEngine:
                             })
                             continue
 
-                        # Защита от переполнения контекста: если нет LIMIT — добавляем
-                        if "limit" not in sql.lower():
+                        # Защита от переполнения контекста: если нет LIMIT — добавляем.
+                        # Для агрегатных запросов (GROUP BY, COUNT/SUM/MIN/MAX/AVG)
+                        # LIMIT бессмысленен — не добавляем и не засоряем лог.
+                        has_aggregate = (
+                            "group by" in sql.lower()
+                            or re.search(
+                                r'\b(count|sum|min|max|avg)\s*\(',
+                                sql,
+                                re.IGNORECASE,
+                            )
+                        )
+                        if "limit" not in sql.lower() and not has_aggregate:
                             if "text_transcrib" in sql.lower() or "dialog_from_whisper" in sql.lower():
                                 sql = sql.rstrip() + " LIMIT 10"
                             else:

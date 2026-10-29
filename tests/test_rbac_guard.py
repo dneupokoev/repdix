@@ -24,6 +24,23 @@ roles:
         allowed_columns: "*"
 """
 
+USERS_COLUMNS_ROLE = """
+roles:
+  test_role:
+    tables:
+      users:
+        allowed_columns: [id, name]
+"""
+
+USERS_EXCLUDED_ROLE = """
+roles:
+  test_role:
+    tables:
+      users:
+        allowed_columns: "*"
+        excluded_columns: [secret]
+"""
+
 ADMIN_STAR_ROLE = """
 roles:
   admin:
@@ -115,3 +132,86 @@ def test_select_star_with_technical_columns(tmp_path):
 
     assert ok is False
     assert "select * forbidden" in reason.lower()
+
+
+# ----------------------------------------------------------------------
+# Регрессия: sqlglot отдаёт Column.table как str (а не exp.Identifier),
+# поэтому обращение column.table.name падало с AttributeError.
+# ----------------------------------------------------------------------
+def test_qualified_column_no_crash(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    sql = "SELECT u.id, u.name FROM users u"
+    ok, result = guard.validate_sql(sql, ["test_role"], "")
+
+    assert ok is True
+    assert result == sql
+
+
+def test_qualified_star_no_crash(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, _ = guard.validate_sql("SELECT u.* FROM users u", ["test_role"], "")
+
+    assert ok is True
+
+
+def test_qualified_technical_column_denied(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_STAR_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql(
+        "SELECT u.technical_id FROM users u", ["test_role"], ""
+    )
+
+    assert ok is False
+    assert "technical" in reason.lower()
+
+
+def test_qualified_star_with_technical_columns(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_STAR_ROLE)
+    guard = RBACGuard(
+        roles_config_path=roles_yaml,
+        technical_columns_getter=lambda table: (
+            {"technical_x"} if table.split(".")[-1] == "users" else set()
+        ),
+    )
+
+    ok, reason = guard.validate_sql("SELECT u.* FROM users u", ["test_role"], "")
+
+    assert ok is False
+    assert "select * forbidden" in reason.lower()
+
+
+def test_qualified_star_with_excluded_columns(tmp_path):
+    """Алиас-звёздочка: правило таблицы ищется по имени таблицы, не по алиасу."""
+    roles_yaml = _write_roles(tmp_path, USERS_EXCLUDED_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql("SELECT u.* FROM users u", ["test_role"], "")
+
+    assert ok is False
+    assert "select * forbidden" in reason.lower()
+
+
+def test_qualified_column_allowed_by_rbac(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_COLUMNS_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, _ = guard.validate_sql("SELECT u.id FROM users u", ["test_role"], "")
+
+    assert ok is True
+
+
+def test_qualified_column_denied_by_rbac(tmp_path):
+    roles_yaml = _write_roles(tmp_path, USERS_COLUMNS_ROLE)
+    guard = RBACGuard(roles_config_path=roles_yaml)
+
+    ok, reason = guard.validate_sql(
+        "SELECT u.secret FROM users u", ["test_role"], ""
+    )
+
+    assert ok is False
+    assert "secret" in reason.lower()
