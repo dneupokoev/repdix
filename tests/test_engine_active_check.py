@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 
 import asyncio
 from unittest.mock import MagicMock
@@ -102,3 +102,40 @@ async def test_admin_can_sql_without_sql_executor():
     resp = await engine.process_message(_msg("/sql SELECT 1"))
     assert "sql_executor" not in resp.text.lower()
     assert "заявка на рассмотрении" not in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_summary_in_system_prompt(monkeypatch):
+    """state.summary добавляется в system_content промпта."""
+    um = MagicMock()
+    um.is_admin.return_value = False
+    um.is_user_active.return_value = True
+    um.get_user_roles.return_value = ["analyst"]
+    engine = _make_engine(um)
+
+    captured = {}
+
+    class FakeLLM:
+        def get_context_length(self, m):
+            return 32768
+        async def chat(self, messages, **kw):
+            captured["system"] = messages[0]["content"]
+            return {"choices": [{"message": {"content": "ok", "tool_calls": None}}]}
+
+    engine.llm_client = FakeLLM()
+
+    from unittest.mock import AsyncMock
+    engine.db_manager = MagicMock()
+    engine.db_manager.get_schemas = AsyncMock(return_value=[])
+    engine.db_manager.get_table_list = AsyncMock(return_value=[])
+    engine.db_manager.get_db_config = MagicMock(return_value={})
+    engine.db_manager.get_db_type = MagicMock(return_value="mysql")
+
+    state = engine.sessions.get("123")
+    state.summary = "Пользователь спрашивал про продажи за сентябрь."
+    state.current_db = "db"
+
+    await engine.process_message(_msg("привет"))
+
+    assert "Резюме предыдущего диалога:" in captured["system"]
+    assert "продажи за сентябрь" in captured["system"]

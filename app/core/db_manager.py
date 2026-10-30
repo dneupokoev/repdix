@@ -1,6 +1,6 @@
 # app/core/db_manager.py
-dv_file_version = '261030.09'
-"""Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite)."""
+dv_file_version = '261030.12'
+"""Менеджер подключений к базам данных (MySQL / MariaDB)."""
 
 import asyncio
 import logging
@@ -9,9 +9,7 @@ import re
 import time
 from typing import Any
 
-import aiosqlite
 import aiomysql
-import asyncpg
 import yaml
 from pymysql.constants import CLIENT
 
@@ -40,6 +38,19 @@ class DBManager:
             )
         except (TypeError, ValueError):
             self.schema_cache_ttl = 3600
+        # Сколько строк максимум читать из БД за один запрос (fetchmany).
+        # Защита от OOM: fetchall() тянул ВЕСЬ результат в память, и
+        # "SELECT * FROM huge" мог уронить процесс.
+        try:
+            self.fetch_limit = max(
+                1, int(os.environ.get("SQL_FETCH_LIMIT") or "1000")
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение SQL_FETCH_LIMIT=%r, используем 1000",
+                os.environ.get("SQL_FETCH_LIMIT"),
+            )
+            self.fetch_limit = 1000
         try:
             self.lock_wait_timeout = int(
                 os.environ.get("LOCK_WAIT_TIMEOUT", "5")
@@ -117,7 +128,7 @@ class DBManager:
         return conf if isinstance(conf, dict) else {}
 
     def get_db_type(self, name: str) -> str:
-        """Возвращает тип БД (mysql/postgresql/sqlite) в нижнем регистре."""
+        """Возвращает тип БД (mysql/mariadb) в нижнем регистре."""
         return (self.get_db_config(name).get('type') or '').lower()
 
     def get_db_description(self, name: str) -> str:
@@ -172,7 +183,7 @@ class DBManager:
           - schemas: [..] — явный список (technical_* отфильтровываются);
           - schemas: "auto" — MySQL: опрос information_schema.schemata с
             вычитанием exclude_schemas и технических схем;
-          - не задано — fallback [conf["database"]] (для SQLite — ["main"]).
+          - не задано — fallback [conf["database"]].
 
         При ошибке SQL логируется warning и возвращается fallback.
         """
@@ -186,9 +197,7 @@ class DBManager:
         fallback_db = (conf.get("database") or "").strip()
 
         def _fallback() -> list[str]:
-            if db_type == "sqlite":
-                return ["main"]
-            if fallback_db and not is_technical(fallback_db):
+            if db_type == "mysql" and fallback_db and not is_technical(fallback_db):
                 return [fallback_db]
             return []
 
@@ -236,7 +245,7 @@ class DBManager:
                         db_name, e,
                     )
                     return []
-            # postgresql/sqlite: auto вне текущей задачи
+            # Прочие типы БД не поддерживаются — fallback.
             result = _fallback()
             self._cache_set(cache_key, result)
             return result
@@ -352,7 +361,10 @@ class DBManager:
                 db=db_conf.get('database', ''),
                 charset=db_conf.get('charset', 'utf8mb4'),
                 autocommit=True,
-                cursorclass=aiomysql.DictCursor,
+                # SSDictCursor — server-side курсор: fetchmany() читает порциями
+                # с сервера, а не из уже загруженного в память буфера. Без этого
+                # "SELECT * FROM huge" тянул весь результат в память (OOM).
+                cursorclass=aiomysql.SSDictCursor,
                 init_command=init_cmd,
                 client_flag=CLIENT.MULTI_STATEMENTS if has_multi else 0,
                 minsize=int(db_conf.get('minsize', 1)),
@@ -371,51 +383,10 @@ class DBManager:
                 )
             return
 
-        elif db_type == 'postgresql':
-            pool_kwargs = dict(
-                host=db_conf.get('host', 'localhost'),
-                port=int(db_conf.get('port', 5432)),
-                user=db_conf.get('user', 'postgres'),
-                password=db_conf.get('password', ''),
-                database=db_conf.get('database', 'postgres'),
-                # Ключи minsize/maxsize едины для MySQL и PostgreSQL (унификация).
-                min_size=int(db_conf.get('minsize', 1)),
-                max_size=int(db_conf.get('maxsize', 5)),
-                command_timeout=self.query_timeout,
-            )
-            server_settings: dict[str, str] = {}
-            if db_conf.get('readonly') is True:
-                server_settings["default_transaction_read_only"] = "on"
-            # statement_timeout — прерывает запрос на стороне сервера
-            server_settings["statement_timeout"] = str(self.query_timeout * 1000)
-            pool_kwargs["server_settings"] = server_settings
-            pool = await asyncpg.create_pool(**pool_kwargs)
-            self.pools[name] = pool
-            return
-
-        elif db_type == 'sqlite':
-            path = db_conf.get('path', ':memory:')
-            conn = await aiosqlite.connect(path)
-            try:
-                # read-only на уровне соединения
-                if db_conf.get('readonly') is True:
-                    await conn.execute("PRAGMA query_only = ON")
-                # WAL для параллельного чтения (если БД файловая)
-                if path != ":memory:":
-                    try:
-                        await conn.execute("PRAGMA journal_mode = WAL")
-                    except Exception:
-                        pass
-                await conn.commit()
-            except Exception as e:
-                logger.error("Ошибка инициализации SQLite %s: %s", path, e)
-                await conn.close()
-                raise
-            self.pools[name] = conn
-            return
-
         else:
-            raise NotImplementedError(f"db type {db_type} not supported yet")
+            raise NotImplementedError(
+                f"db type {db_type} not supported (only mysql/mariadb)"
+            )
 
     async def _check_mysql_grants(self, name: str, pool) -> None:
         """Проверяет права MySQL-пользователя через SHOW GRANTS.
@@ -492,10 +463,12 @@ class DBManager:
             name: Имя БД.
             sql: SQL-запрос.
             params: Параметры (для параметризованных запросов). Для MySQL
-                используется %s, для PostgreSQL — $1, для SQLite — ?.
+                используется %s.
 
         Returns:
-            Список словарей с результатами запроса.
+            Список словарей с результатами запроса. Читается не более
+            ``SQL_FETCH_LIMIT + 1`` строк (fetchmany/серверный курсор):
+            полный результат в память не тянется (защита от OOM).
         """
         if name not in self.pools:
             await self.connect(name)
@@ -511,7 +484,10 @@ class DBManager:
                             await cur.execute(sql, params)
                         else:
                             await cur.execute(sql)
-                        rows = await cur.fetchall()
+                        # fetchmany вместо fetchall: не тянем весь результат
+                        # в память. +1 строка — чтобы отличить "ровно limit"
+                        # от "есть ещё строки".
+                        rows = await cur.fetchmany(self.fetch_limit + 1)
                         return rows if rows is not None else []
 
             # ВАЖНО: asyncio.wait_for снимает ожидание в Python, но НЕ отменяет
@@ -530,44 +506,10 @@ class DBManager:
                     "проверьте slow_query_log."
                 )
 
-        elif db_type == 'postgresql':
-            async with pool.acquire() as conn:
-                if params is not None:
-                    rows = await conn.fetch(sql, *params, timeout=self.query_timeout)
-                else:
-                    rows = await conn.fetch(sql, timeout=self.query_timeout)
-            return [dict(row) for row in rows]
-
-        elif db_type == 'sqlite':
-            try:
-                if params is not None:
-                    cursor = await pool.execute(sql, params)
-                else:
-                    cursor = await pool.execute(sql)
-            except Exception:
-                raise
-            try:
-                rows = await asyncio.wait_for(cursor.fetchall(), timeout=self.query_timeout)
-                description = cursor.description
-            except asyncio.TimeoutError:
-                raise TimeoutError(
-                    f"Query timeout exceeded ({self.query_timeout} sec)"
-                )
-            finally:
-                try:
-                    await cursor.close()
-                except Exception:
-                    pass
-
-            if not rows:
-                return []
-            if description is None:
-                return []
-            col_names = [d[0] for d in description]
-            return [dict(zip(col_names, row)) for row in rows]
-
         else:
-            raise NotImplementedError(f"db type {db_type} not supported yet")
+            raise NotImplementedError(
+                f"db type {db_type} not supported (only mysql/mariadb)"
+            )
 
     # ------------------------------------------------------------------
     # Метаданные
@@ -625,25 +567,10 @@ class DBManager:
                 (schema,),
             )
             value_key = "table_name"
-        elif db_type == 'postgresql':
-            rows = await self.execute_query(
-                db_name,
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = $1 "
-                "ORDER BY table_name",
-                (schema,),
-            )
-            value_key = "table_name"
-        elif db_type == 'sqlite':
-            rows = await self.execute_query(
-                db_name,
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-                "ORDER BY name",
-            )
-            value_key = "name"
         else:
-            raise NotImplementedError(f"db type {db_type} not supported yet")
+            raise NotImplementedError(
+                f"db type {db_type} not supported (only mysql/mariadb)"
+            )
 
         result: list[str] = []
         for row in rows or []:
@@ -665,8 +592,7 @@ class DBManager:
         Args:
             db_name: Имя БД из конфигурации.
             table_name: Имя таблицы (без схемы).
-            schema: Схема. Если None — берётся conf["database"]
-                (для SQLite — "main").
+            schema: Схема. Если None — берётся conf["database"].
 
         Returns:
             Список словарей с ключами column_name, data_type, column_comment.
@@ -677,8 +603,6 @@ class DBManager:
         db_type = self.get_db_type(db_name)
         if schema is None:
             schema = (self.get_db_config(db_name).get("database") or "").strip()
-            if db_type == "sqlite":
-                schema = "main"
 
         cache_key = ("columns", db_name, schema or "*", table_name)
         cached = self._cache_get(cache_key)
@@ -708,48 +632,10 @@ class DBManager:
             self._cache_set(cache_key, result)
             return result
 
-        elif db_type == 'postgresql':
-            rows = await self.execute_query(
-                db_name,
-                "SELECT c.column_name, c.data_type, "
-                "       COALESCE(d.description, '') AS column_comment "
-                "FROM information_schema.columns c "
-                "LEFT JOIN pg_catalog.pg_statio_all_tables st "
-                "  ON st.schemaname = c.table_schema AND st.relname = c.table_name "
-                "LEFT JOIN pg_catalog.pg_description d "
-                "  ON d.objoid = st.relid AND d.objsubid = c.ordinal_position "
-                "WHERE c.table_schema = $1 AND c.table_name = $2 "
-                "ORDER BY c.ordinal_position",
-                (schema, table_name),
-            )
-            result = [
-                dict(row)
-                for row in (rows or [])
-                if not is_technical(row["column_name"])
-            ]
-            self._cache_set(cache_key, result)
-            return result
-
-        elif db_type == 'sqlite':
-            if db_name not in self.pools:
-                await self.connect(db_name)
-            pool = self.pools[db_name]
-            if not re.fullmatch(r'[A-Za-z0-9_]+', table_name):
-                logger.warning("Invalid table_name for SQLite PRAGMA: %s", table_name)
-                return []
-            cursor = await pool.execute(f"PRAGMA table_info({table_name})")
-            rows = await cursor.fetchall()
-            await cursor.close()
-            result = [
-                {"column_name": row[1], "data_type": row[2], "column_comment": ""}
-                for row in (rows or [])
-                if not is_technical(row[1])
-            ]
-            self._cache_set(cache_key, result)
-            return result
-
         else:
-            raise NotImplementedError(f"db type {db_type} not supported yet")
+            raise NotImplementedError(
+                f"db type {db_type} not supported (only mysql/mariadb)"
+            )
 
     # ------------------------------------------------------------------
     # Закрытие
@@ -764,18 +650,11 @@ class DBManager:
 
         for name, pool in list(self.pools.items()):
             try:
-                # aiosqlite.Connection: имеет close(), но НЕ wait_closed().
-                # aiomysql.Pool / asyncpg.Pool: имеют close() и wait_closed()
-                # (или aclose()). Различаем через hasattr(wait_closed).
+                # aiomysql.Pool: имеет close() и wait_closed().
+                # Различаем через hasattr(wait_closed).
                 if hasattr(pool, "wait_closed"):
                     pool.close()
                     await pool.wait_closed()
-                elif isinstance(pool, aiosqlite.Connection):
-                    try:
-                        await pool.commit()
-                    except Exception:
-                        pass
-                    await pool.close()
                 else:
                     # Неизвестный тип — пробуем close()
                     close = getattr(pool, "close", None)

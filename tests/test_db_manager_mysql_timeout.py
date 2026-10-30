@@ -11,7 +11,7 @@ dv_file_version = '261030.04'
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
 from pymysql.constants import CLIENT
@@ -302,3 +302,27 @@ def test_client_flag_zero_when_single_statement(
 
     assert captured["init_command"] == "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'"
     assert captured["client_flag"] == 0
+
+
+def test_mysql_pool_uses_ssdictcursor(tmp_path: Path, monkeypatch) -> None:
+    """MySQL-пул использует SSDictCursor (серверный курсор, без OOM)."""
+    import aiomysql
+
+    manager = _make_manager(tmp_path, _base_conf())
+    captured: dict = {}
+
+    async def fake_create_pool(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "app.core.db_manager.aiomysql.create_pool", fake_create_pool,
+    )
+    # Замокаем _check_mysql_grants, чтобы не лезть в fake-пул.
+    async def _noop_grants(name, pool):
+        return
+    monkeypatch.setattr(manager, "_check_mysql_grants", _noop_grants)
+
+    asyncio.run(manager.connect("main_db"))
+
+    assert captured["cursorclass"] is aiomysql.SSDictCursor

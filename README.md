@@ -3,22 +3,25 @@
 **💡 AI-аналитик** — Telegram-бот-оркестратор аналитики: переводит вопросы на естественном языке в SQL и возвращает глубокий аналитический ответ.
 
 ## 🎯 1. Цель проекта
-Создать универсального Telegram-бота-оркестратора с системой модерации доступа, который принимает вопросы на естественном языке, переводит их в SQL-запросы через LLM, выполняет их в базе данных (MySQL, PostgreSQL, SQLite) и возвращает пользователю **глубокий аналитический ответ**.
+
+Создать универсального Telegram-бота-оркестратора с системой модерации доступа, который принимает вопросы на естественном языке, переводит их в SQL-запросы через LLM, выполняет их в базе данных (MySQL/MariaDB) и возвращает пользователю **глубокий аналитический ответ**.
 
 Бот работает в режиме **AI-агента**: он умеет самостоятельно строить цепочки SQL-запросов (Agent Loop), находить скрытые закономерности (например, «почему упали продажи»), показывать процесс своих рассуждений в реальном времени (Chain of Thought) и прерывать выполнение по команде `/stop`.
 
 ## 🛠️ 2. Технологический стек
+
 - **Язык:** Python 3.12.
 - **Менеджер зависимостей:** Pipenv.
 - **Асинхронность:** `asyncio`, `asyncio.Task` (для фоновых задач и отмены).
 - **Telegram:** `aiogram` (v3.x) + `FSMContext` (для интервью при регистрации и редактирования памяти).
 - **LLM:** `openai` (AsyncOpenAI). Основная модель — **DeepSeek V4.1 Flash** (через OpenCode Zen) или локальные аналоги.
-- **Базы данных:** `aiomysql` (MySQL), `asyncpg` (PostgreSQL), `aiosqlite` (SQLite).
+- **Базы данных:** `aiomysql` (MySQL/MariaDB).
 - **Кэширование:** `redis.asyncio`.
 - **Конфигурация:** `python-dotenv` и `PyYAML`.
-- **Парсер SQL:** `sqlglot` (диалект `mysql` для RBAC-разбора; диалекты `mysql`/`postgres`/`sqlite` для проверки сложности).
+- **Парсер SQL:** `sqlglot` (диалект `mysql` — для RBAC-разбора и проверки сложности).
 
 ## 🏗️ 3. Архитектура (Порты и Адаптеры)
+
 Ядро ничего не знает о Telegram. Общение идёт через абстрактные интерфейсы.
 
 ```text
@@ -33,8 +36,8 @@ repdix/
 │   │   ├── cache_manager.py    # Redis (история диалогов, память, session:{user_id});
 │   │   │                       # клиент без retry_on_timeout; fail-fast при открытом
 │   │   │                       # Redis на не-loopback хосте без пароля (CVE-2025-21605)
-│   │   ├── db_manager.py       # пулы соединений (MySQL/PostgreSQL/SQLite), таймауты,
-│   │   │                       # read-only, init_statements, метаданные, multi-schema,
+│   │   ├── db_manager.py       # пулы соединений (MySQL/MariaDB), таймауты, read-only,
+│   │   │                       # init_statements, метаданные, multi-schema,
 │   │   │                       # lock_wait_timeout для MySQL/MariaDB,
 │   │   │                       # выполнение запросов без SQL-комментариев;
 │   │   │                       # CLIENT.MULTI_STATEMENTS — только при ';' в init_cmd;
@@ -86,21 +89,22 @@ repdix/
 │   ├── roles.yaml              # описание ролей и прав (RBAC), включая sql_executor
 │   └── help.md                 # справка /help
 ├── data/                       # локальные данные (опционально)
-├── tests/                      # pytest (19 файлов, 196+ тестов; см. раздел 10)
+├── tests/                      # pytest (19 файлов, 201+ тестов; см. раздел 10)
 ├── logs/                       # audit.log, security.log, manual_sql.log (ротация, НЕ КОММИТИТЬ)
 ├── .env                        # секреты (НЕ КОММИТИТЬ)
 └── .gitignore
 ```
 
 ### 3.1. Ключевые модули
+
 - `app/main.py` — запуск приложения, инициализация сервисов, загрузка `.env` **до** `_setup_logging` (иначе `LOG_MAX_BYTES`/`SECURITY_LOG_*` из `.env` не применяются), предсказуемый выбор адаптера (`telegram` или `cli`), диагностика выбора в логах, корректное завершение (`_shutdown`: остановка cleanup-таска, отмена сессий, закрытие пулов БД/LLM/Redis/адаптера). `_env_int` — безопасный парсинг `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`/`SECURITY_LOG_*`.
-- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, вызов `sql_complexity.check_complexity` перед выполнением SQL, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`. `_format_sql_result` кэширует набор текстовых колонок (`_text_columns_cache`, ключ `(db, schema, table)`), чтобы не запрашивать `information_schema` на каждый вызов. `_extract_table_from_sql` и `_extract_last_table_from_history` работают через `sqlglot` (кавычки, CTE, подзапросы; системные таблицы пропускаются). **Проверка `is_active` в начале `process_message`** для всех команд, кроме `/start` и `/help` — заблокированный/неодобренный пользователь получает «заявка на рассмотрении» на любую команду. **Ветка `/sql`** дополнительно проверяет роль `sql_executor` (или `is_admin`) — роль не даёт доступа к таблицам, RBAC проверяет по остальным ролям. **`/sql` не проходит `check_complexity`** — см. раздел 9.
+- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, вызов `sql_complexity.check_complexity` перед выполнением SQL, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`. `_format_sql_result` кэширует набор текстовых колонок (`_text_columns_cache`, ключ `(db, schema, table)`), чтобы не запрашивать `information_schema` на каждый вызов. `_extract_table_from_sql` и `_extract_last_table_from_history` работают через `sqlglot` (кавычки, CTE, подзапросы; системные таблицы пропускаются). **Проверка `is_active` в начале `process_message`** для всех команд, кроме `/start` и `/help` — заблокированный/неодобренный пользователь получает «заявка на рассмотрении» на любую команду. После LLM-ответа вызывается `_persist_session` (`last_sqls` в `session:{user_id}`); `state.summary` добавляется в `system_content` промпта. `audit.log` и `last_sqls` содержат SQL ДО auto-LIMIT (оригинал), в БД уходит SQL с auto-LIMIT. **Ветка `/sql`** дополнительно проверяет роль `sql_executor` (или `is_admin`) — роль не даёт доступа к таблицам, RBAC проверяет по остальным ролям. **`/sql` не проходит `check_complexity`** — см. раздел 9.
 - `app/core/session.py` — состояние сессии, история, блокировки, активные задачи, резюме диалога (`summary`), долгосрочная память (`long_term_facts`) и TTL-хранилище сессий. **Фоновая очистка** (`start_cleanup_task`/`stop_cleanup_task`, интервал 300 сек) — иначе при малом числе пользователей просроченные сессии жили бы до рестарта. Ленивая очистка `_cleanup_expired` раз в 100 обращений к `get()` сохранена как дополнительный механизм.
-- `app/core/db_manager.py` — пулы подключений к MySQL/PostgreSQL/SQLite, таймауты, `lock_wait_timeout` (MySQL/MariaDB), read-only-режим, `init_statements`, кэш метаданных и поддержка нескольких схем (`multi-schema`). Перед отправкой запроса в БД SQL-комментарии вырезаются. **Важно:** `CLIENT.MULTI_STATEMENTS` включается **только если `init_cmd` содержит `;`** (несколько `SET SESSION`) — иначе флаг `0`, чтобы не расширять поверхность атаки. При создании MySQL-пула выполняется `SHOW GRANTS FOR CURRENT_USER()`: если у пользователя есть права на запись (включая `FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`), в `security.log` пишется WARNING (запуск не блокируется — см. раздел 4.1). `get_schemas(auto)` при сбое возвращает `[]` (а не fallback-схему) — чтобы LLM не получила ложную картину. `execute_query` (MySQL) содержит комментарий: `asyncio.wait_for` не отменяет серверный запрос, основная защита — `MAX_EXECUTION_TIME`.
+- `app/core/db_manager.py` — пулы подключений к MySQL/MariaDB, таймауты, `lock_wait_timeout` (MySQL/MariaDB), read-only-режим, `init_statements`, кэш метаданных и поддержка нескольких схем (`multi-schema`). Перед отправкой запроса в БД SQL-комментарии вырезаются. **Важно:** `CLIENT.MULTI_STATEMENTS` включается **только если `init_cmd` содержит `;`** (несколько `SET SESSION`) — иначе флаг `0`, чтобы не расширять поверхность атаки. Запросы читаются через `fetchmany` (`SSDictCursor`): не более `SQL_FETCH_LIMIT + 1` строк, защита от OOM. При создании MySQL-пула выполняется `SHOW GRANTS FOR CURRENT_USER()`: если у пользователя есть права на запись (включая `FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`), в `security.log` пишется WARNING (запуск не блокируется — см. раздел 4.1). `get_schemas(auto)` при сбое возвращает `[]` (а не fallback-схему) — чтобы LLM не получила ложную картину. `execute_query` содержит комментарий: `asyncio.wait_for` не отменяет серверный запрос, основная защита — `MAX_EXECUTION_TIME`.
 - `app/core/llm_client.py` — клиент LLM, hot-reload `models.yaml`, `max_tokens`, `temperature`, fallback на `tool_choice`/`tools` при ошибках API. При hot-reload, если event loop закрыт, старый клиент попадает в `_orphaned_clients` и закрывается в `close()` (иначе утечка соединений).
 - `app/core/cache_manager.py` — Redis-кэш истории диалогов, памяти и `session:{user_id}`, graceful degradation при недоступности Redis. Redis-клиент создаётся без `retry_on_timeout`. **Fail-fast:** открытый в сеть Redis без пароля на не-loopback хосте запрещён (CVE-2025-21605).
 - `app/core/rbac_guard.py` — контроль доступа к таблицам и полям на основе AST `sqlglot`, правила вида `schema.*`, блокировка системных таблиц (`information_schema`, `pg_catalog`, `sqlite_master`) в любом месте AST, блокировка `SELECT *` при наличии ограничений, метод `expand_select_star` для авто-развёртывания звёздочки в разрешённые поля. **Порядок проверки:** точное `schema.table` → `*` → `schema.*` → короткое имя (только если схема не указана). Для неквалифицированных колонок при нескольких таблицах — требование «разрешена во ВСЕХ таблицах» (`all`, не `any`). `COUNT(*)` не блокируется правилом `excluded_columns`/`allowed_columns` (агрегат не возвращает поля).
-- `app/core/sql_complexity.py` — проверка сложности SQL на уровне AST: количество `JOIN`, наличие `JOIN` без условия (декартово произведение), максимальная глубина вложенности `Subquery`, количество `UNION`. Пороги задаются через env (`SQL_MAX_JOINS`, `SQL_MAX_SUBQUERY_DEPTH`, `SQL_MAX_UNIONS`). При превышении — `SQLTooComplex`, запрос не выполняется, модели возвращается tool-сообщение с причиной. **`RecursionError` в `_max_subquery_depth` превращается в `SQLTooComplex`** (fail-closed: engine вернёт внятный отказ, а не «Ошибка LLM»). Диалекты: `mysql` (MySQL/MariaDB), `postgres` (PostgreSQL), `sqlite`; `postgresql` нормализуется в `postgres`.
+- `app/core/sql_complexity.py` — проверка сложности SQL на уровне AST: количество `JOIN`, наличие `JOIN` без условия (декартово произведение), максимальная глубина вложенности `Subquery`, количество `UNION`. Пороги задаются через env (`SQL_MAX_JOINS`, `SQL_MAX_SUBQUERY_DEPTH`, `SQL_MAX_UNIONS`). При превышении — `SQLTooComplex`, запрос не выполняется, модели возвращается tool-сообщение с причиной. **`RecursionError` в `_max_subquery_depth` превращается в `SQLTooComplex`** (fail-closed: engine вернёт внятный отказ, а не «Ошибка LLM»). Диалект: `mysql` (MySQL/MariaDB).
 - `app/core/technical_filter.py` — скрытие технических таблиц и колонок по префиксам из `TECHNICAL_PREFIXES`. Техничным считается имя, у которого **любая** часть (разделённая точками) начинается с префикса: `technical_schema.users`, `db.technical_logs`, `db.technical_foo.bar`.
 - `app/core/validator.py` — проверка SQL: только `SELECT`/`WITH`, запрещённые ключевые слова, опасные паттерны, fail-closed парсинг через `sqlglot`, корректная обработка SQL-комментариев без пробела после `--`, отказ при `;` вне строковых литералов. **DANGEROUS_PATTERNS ищутся только вне строковых литералов** (`_strip_string_literals`): `SELECT 'SET GLOBAL x'` разрешён, `SET GLOBAL` как команда — нет.
 - `app/core/user_manager.py` — модерация пользователей, hot-reload `users.yaml`, защита администраторов (env-админы не перезаписываются и не удаляются), атомарная запись через `os.replace` с `fsync` (защита от потери `users.yaml` при падении питания). **Блокировка отзывает роли:** `reject_user` и `toggle_user_active` (при `new_active=False`) очищают `roles` — иначе заблокированный пользователь с сохранёнными ролями (включая `sql_executor`) продолжил бы иметь доступ к `/sql`. Разблокировка **не** восстанавливает роли автоматически — админ назначает заново.
@@ -110,6 +114,7 @@ repdix/
 - `app/interfaces/cli_adapter.py` — консольный адаптер для отладки. Предупреждает, если `CLI_USER_ID` не админ (RBAC заблокирует таблицы). `Ctrl+C` отменяет текущий запрос (аналог `/stop`; в CLI сам `/stop` уходит в LLM — используйте `Ctrl+C`).
 
 ### 3.2. Поток обработки запроса
+
 1. Адаптер (`telegram_adapter.py` или `cli_adapter.py`) принимает сообщение пользователя и передаёт его в ядро.
 2. `engine.process_message` **проверяет `is_active`** для всех команд, кроме `/start` и `/help`: заблокированный/неодобренный пользователь получает «заявка на рассмотрении» и не доходит до команд.
 3. `engine.py` формирует системный промпт с учётом динамической схемы БД, истории, долгосрочной памяти и RBAC-правил.
@@ -118,30 +123,27 @@ repdix/
 6. Статусы Chain of Thought отправляются через `status_callback`; ответ пользователю рендерится адаптером (в Telegram — с `parse_mode=HTML`, после `sanitize_telegram_html`).
 
 ## 🗄️ 4. Работа с базами данных
+
 - **Шаблоны в `config/databases.yaml`**: реальные значения подставляются из `.env` через `${VAR}`.
 - **Ограничения на стороне СУБД.** Бот должен работать под пользователем БД, у которого есть **только права `SELECT`**. `readonly: true`, валидатор SQL и проверка сложности — дополнительные барьеры, но **не замена** правам на уровне БД (см. раздел 4.1).
 - **SQL-комментарии:** перед отправкой запроса в БД комментарии вырезаются (`strip_sql_comments` — только вне строковых литералов); валидатор при этом корректно обрабатывает SQL-комментарии, в том числе без пробела после `--`.
 - **Таймауты:** `SQL_QUERY_TIMEOUT` (по умолчанию 15 секунд) прерывает тяжёлые запросы:
   - **MySQL:** `SET SESSION MAX_EXECUTION_TIME` (только MySQL 5.7.8+, не MariaDB). Ставится через `init_command` при создании пула — то есть на каждое соединение, **в том числе при `readonly: true`** (несколько простых `SET SESSION` склеиваются в один запрос).
   - **MariaDB:** вместо `MAX_EXECUTION_TIME` бот автоматически выставляет `SET SESSION max_statement_time` (в секундах). Для этого в `databases.yaml` нужно указать `is_mariadb: true`.
-  - **PostgreSQL:** `statement_timeout` в `server_settings` (прерывает запрос на стороне сервера), плюс `command_timeout` в пуле.
-  - **SQLite:** `asyncio.wait_for` вокруг `cursor.fetchall()`.
   - **Клиентская страховка:** для MySQL — `asyncio.wait_for(timeout=SQL_QUERY_TIMEOUT+2)` вокруг выполнения. Это **не отменяет** серверный запрос (aiomysql не шлёт `KILL QUERY`), а лишь снимает ожидание в Python; серверный таймаут (`MAX_EXECUTION_TIME`) остаётся основной защитой.
 - **Ожидание блокировок (MySQL/MariaDB):** `MAX_EXECUTION_TIME` и `max_statement_time` **не запускают таймер**, пока запрос ждёт блокировку. Поэтому в тот же `init_command` добавляются:
   - `SET SESSION innodb_lock_wait_timeout = <LOCK_WAIT_TIMEOUT>` — ограничивает ожидание InnoDB row-level lock;
   - `SET SESSION lock_wait_timeout = <LOCK_WAIT_TIMEOUT>` — ограничивает ожидание metadata lock (MDL).
-  Значение `LOCK_WAIT_TIMEOUT` берётся из env (по умолчанию 5 секунд). Если значение <= 0 — используется 5 и пишется warning в лог. Для PostgreSQL/SQLite эти команды не добавляются.
+  Значение `LOCK_WAIT_TIMEOUT` берётся из env (по умолчанию 5 секунд). Если значение <= 0 — используется 5 и пишется warning в лог.
 - **Режим транзакций read-only (выставляется при `readonly: true`):**
   - **MySQL:** `SET SESSION transaction_read_only = 1` (при `readonly: true`, включая MariaDB). Серверный таймаут и `lock_wait_timeout` выставляются в том же `init_command`: несколько `SET SESSION` склеиваются через `; `. `CLIENT.MULTI_STATEMENTS` включается **только если `init_cmd` содержит `;`** (то есть когда `SET SESSION` действительно несколько) — иначе `client_flag=0`, чтобы не расширять поверхность атаки. Пользователь БД с правами только `SELECT` по-прежнему рекомендуется как основной барьер.
-  - **PostgreSQL:** `default_transaction_read_only = on` в `server_settings`.
-  - **SQLite:** `PRAGMA query_only = ON`.
 - **MariaDB:** установите `is_mariadb: true` в `databases.yaml`. Бот не будет ставить `MAX_EXECUTION_TIME` (MariaDB его не понимает) и вместо него выполнит `SET SESSION max_statement_time = <SQL_QUERY_TIMEOUT>`. `innodb_lock_wait_timeout` и `lock_wait_timeout` ставятся и для MariaDB.
-- **Multi-schema:** одна MySQL-БД может содержать несколько схем. Список задаётся в `databases.yaml` (`schemas: auto` или явный список), исключения — `exclude_schemas`. Результат кэшируется на `SCHEMA_CACHE_TTL_SEC` (по умолчанию 3600 сек). Таблицы в промпте и в `get_table_list()` возвращаются fully-qualified (`schema.table`); `get_table_schema()` принимает `(db, table, schema)`. Для `schemas: auto` поддерживается только MySQL; для PostgreSQL/SQLite используется fallback `[conf["database"]]` (или `["main"]` для SQLite). **При сбое `schemas: auto` возвращается `[]`** (а не fallback-схема): LLM увидит «—» и не будет генерировать SQL по несуществующей таблице. Пустой список **не кэшируется** — при восстановлении БД следующий вызов снова опросит `information_schema`.
+- **Multi-schema:** одна MySQL-БД может содержать несколько схем. Список задаётся в `databases.yaml` (`schemas: auto` или явный список), исключения — `exclude_schemas`. Результат кэшируется на `SCHEMA_CACHE_TTL_SEC` (по умолчанию 3600 сек). Таблицы в промпте и в `get_table_list()` возвращаются fully-qualified (`schema.table`); `get_table_schema()` принимает `(db, table, schema)`. Для `schemas: auto` поддерживается только MySQL. **При сбое `schemas: auto` возвращается `[]`** (а не fallback-схема): LLM увидит «—» и не будет генерировать SQL по несуществующей таблице. Пустой список **не кэшируется** — при восстановлении БД следующий вызов снова опросит `information_schema`.
 - **init_statements:** необязательный список SQL-команд в `databases.yaml`, которые выполняются при создании **каждого** соединения MySQL-пула. Поддерживается подстановка `{timeout}` (= `SQL_QUERY_TIMEOUT`, сек). Readonly, таймаут и `lock_wait_timeout` бот выставляет сам; `init_statements` — только для дополнительных настроек сессии. «Простые» `SET SESSION` склеиваются в один запрос через `; `. `CLIENT.MULTI_STATEMENTS` включается **только если итоговый `init_cmd` содержит `;`** (то есть когда команд действительно несколько) — иначе флаг `0`, чтобы не расширять поверхность атаки. **Ограничение:** не используйте `;` внутри строковых литералов — `MULTI_STATEMENTS` разорвёт команду. Бот пишет WARNING, если `;` встречается вне литералов (это может быть намеренно — несколько `SET SESSION` — но чаще ошибка).
 
 ### 4.1. 🔐 Безопасность базы данных
 
-⚠️ **ВАЖНО:** Для безопасности бот должен подключаться к базе данных под пользователем, у которого есть **ТОЛЬКО права на `SELECT` (чтение)**. Параметр `readonly: true` в `databases.yaml` **не заменяет** права БД, он лишь выставляет режим транзакций (`SET SESSION transaction_read_only = 1`, `default_transaction_read_only = on`, `PRAGMA query_only = ON`). Если у пользователя БД есть права на запись, скомпрометированная LLM может изменить данные.
+⚠️ **ВАЖНО:** Для безопасности бот должен подключаться к базе данных под пользователем, у которого есть **ТОЛЬКО права на `SELECT` (чтение)**. Параметр `readonly: true` в `databases.yaml` **не заменяет** права БД, он лишь выставляет режим транзакций (`SET SESSION transaction_read_only = 1`). Если у пользователя БД есть права на запись, скомпрометированная LLM может изменить данные.
 
 Валидатор SQL (`validate_sql`), RBAC-гард и проверка сложности (`check_complexity`) — лишь дополнительный барьер; они не заменяют ограничения прав на стороне СУБД и не гарантируют неизменность данных.
 
@@ -151,7 +153,7 @@ repdix/
 
 ### 4.2. 🩺 Диагностика тяжёлых запросов (`slow_query_log`) — на стороне админа БД
 
-`MAX_EXECUTION_TIME`, `max_statement_time`, `statement_timeout` и `lock_wait_timeout` — это **защита**, но она не всегда срабатывает (например, запрос может «проскочить» проверку таймера в некоторых фазах выполнения). Для **диагностики** инцидентов админу БД рекомендуется включить `slow_query_log`:
+`MAX_EXECUTION_TIME`, `max_statement_time` и `lock_wait_timeout` — это **защита**, но она не всегда срабатывает (например, запрос может «проскочить» проверку таймера в некоторых фазах выполнения). Для **диагностики** инцидентов админу БД рекомендуется включить `slow_query_log`:
 
 **MySQL:**
 ```sql
@@ -172,6 +174,7 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 ## 🧠 5. Работа с моделями и AI-Агент
 
 ### 5.1. Agent Loop (Цикл агента)
+
 В `engine.py` реализован цикл `while step < max_steps`. Лимит шагов задаётся переменной окружения `AGENT_MAX_STEPS` (по умолчанию 10, минимум 1): пяти шагов не хватало сложным вопросам (несколько SQL подряд + финальный вывод). Модель может: изучить структуру таблиц (из системного промпта), выполнить несколько SQL-запросов, сравнить результаты и написать бизнес-вывод. Если цикл оборвался по лимиту и модель так и не вернула текст, в лог пишется `WARNING "Agent loop reached max_steps"` с полями `steps`, `max_steps`, `user_id`; затем модели отправляется system-сообщение с требованием написать финальный ответ (без инструментов).
 **Важно:** В цикле сообщения модели обязательно передаются с ролью `"tool"` и `tool_call_id`, иначе DeepSeek вернёт ошибку 400.
 
@@ -180,18 +183,21 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 **Неизвестные инструменты:** если LLM вернула `tool_call` с именем, отличным от `execute_sql`/`get_relations`, ядро логирует WARNING и возвращает модели tool-сообщение `Ошибка: неизвестный инструмент '<name>'` (без выполнения).
 
 ### 5.2. Chain of Thought (Прозрачность)
+
 Перед каждым вызовом инструмента модель пишет краткое пояснение.
 **Как это работает:** В `ChatMessage` есть `status_callback`. `telegram_adapter.py` отправляет эти статусы пользователю (вида `🤖 Сейчас посмотрю структуру...`). В `engine.py` текст перехватывается и отправляется через колбэк. Автоматическая обрезка статусов в ядре удалена (метод `_shorten_text` больше не используется), поэтому статусы отправляются как есть; HTML-разметка в Telegram сохраняется после `sanitize_telegram_html`. `cli_adapter.py` печатает статусы с отступом. Ответы Telegram отправляются с `parse_mode=HTML`.
 
 **Важно:** если модель вернула `tool_calls`, но пустой `content`, статус формируется как `🤖 Выполняю <tool_name>...`. Если `content` непустой — он очищается от HTML-тегов и схлопывается в одну строку (статусы — plain text).
 
 ### 5.3. Инструменты модели (Tool Calling)
+
 Доступны инструменты:
 - `execute_sql` — для сложных аналитических SELECT-запросов. Перед выполнением проходит `validator.validate_sql`, `rbac_guard.validate_sql` и `sql_complexity.check_complexity`.
 - `get_relations` — узнать связи таблиц. Проходит проверку `is_technical_qualified` для имени таблицы и RBAC через `validate_sql("SELECT 1 FROM <table>")`. Связи фильтруются: технические колонки и таблицы-цели (`ref_table`) скрываются.
 - **⚠️ Важно:** `SHOW COLUMNS` и `SHOW TABLES` **не пройдут** `validator.validate_sql` — только `SELECT` и `WITH`. Вся нужная информация о структуре уже в промпте (динамическая схема).
 
 ### 5.4. Управление историей, контекстом и долгосрочной памятью
+
 - **Динамическая схема БД:** в промпт передаются поля только для тех таблиц, которые упомянуты в вопросе, последних 4 сообщениях истории или последних SQL. Если совпадений нет — передаётся только список имён таблиц (экономия контекста). Поиск таблиц: прямое упоминание (полное имя или сегменты через `_`), смысловые подсказки (`центр` → `center`/`centers`, `выручк` → `revenue`/`appointment`/`sales` и т.п. — см. `_TABLE_KEYWORD_HINTS`).
 - **Auto-Compact:** при достижении 60% лимита контекста первые 4 сообщения истории сжимаются LLM в 2 предложения и заменяются одним `system`-сообщением (резюме сохраняется в `state.summary` и в Redis).
 - **Жёсткая обрезка:** при > 80% лимита история обрезается до 2 последних сообщений; при повторном переполнении — ошибка с просьбой использовать `/compact` или `/clear`.
@@ -203,16 +209,20 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 - **`/stop`** — прерывание текущего анализа (отмена `asyncio.Task`). Задачи, запущенные **после** рестарта, отменяются нормально. Задачи, запущенные **до** рестарта, не «докручиваются»: объекты `asyncio.Lock` и `current_task` не сериализуются в Redis (см. раздел 9). В CLI сам `/stop` уходит в LLM — используйте `Ctrl+C` (аналог `/stop`).
 
 ## 🛡️ 6. Управление доступом (Модерация и RBAC)
+
 Доступ к боту строго контролируется:
+
 1. **Администраторы** (указаны в `ADMIN_USERS` в `.env` или имеют роль `admin` в `users.yaml`) имеют доступ ко всему. При старте `user_manager.sync_admins()` гарантирует, что все ID из `.env` имеют `is_active: true` и `roles: ["admin"]`. Админам `/sql` доступен автоматически (роль `sql_executor` не нужна).
 2. **Обычные пользователи** при первом `/start` проходят интервью (ФИО, Отдел, Цель). Данные сохраняются в `config/users.yaml` (с флагом `is_active: false`). Пока админ не одобрит заявку, бот не пустит пользователя к LLM. **Файл перечитывается «на лету» (hot-reload по mtime) при каждом запросе, перезапуск не нужен.**
+
+   > ⚠️ Не редактируйте `config/users.yaml` вручную, пока бот работает — используйте `/users`. `_save_users_yaml` делает `os.replace`, и ручные правки могут быть перезаписаны.
 3. **Модерация:** админ получает уведомление с кнопками «✅ Одобрить» / «❌ Отклонить». После отклонения появляется кнопка «🔄 Сбросить статус» — она **удаляет** пользователя из `users.yaml`, чтобы он мог подать заявку заново (`reject_user` этого не делает). **Блокировка отзывает роли:** `reject_user` и `toggle_user_active` (при блокировке) очищают `roles` — иначе заблокированный пользователь с сохранёнными ролями (включая `sql_executor`) продолжил бы иметь доступ к `/sql`. Разблокировка **не** восстанавливает роли автоматически — админ назначает заново (осознанно).
 4. **Проверка `is_active` в `engine.process_message`:** для **всех** команд, кроме `/start` и `/help`. Заблокированный/неодобренный пользователь получает «заявка на рассмотрении у администратора» на `/db`, `/model`, `/settings`, `/sql`, `/remember`, `/memory` и т.д. Это закрывает сценарий, когда `handle_message` (telegram_adapter) пропускал сервисные команды мимо `is_user_active`.
 5. **RBAC (Role-Based Access Control):** В `config/roles.yaml` описываются роли и права на таблицы/поля. `RBACGuard` физически блокирует запросы к запрещённым таблицам и полям. Проверка идёт по полному имени `schema.table`; `SELECT *` запрещён, если у таблицы есть `excluded_columns` **или** явный белый список `allowed_columns` (защита от утечки полей вне списка). При отказе именно из-за `SELECT *` ядро пробует развернуть звёздочку в разрешённые поля (`expand_select_star`) и повторить проверку — безопасность при этом не ослабляется (подставляются только разрешённые поля; технические поля отбрасываются). Правила могут задаваться как для конкретных таблиц, так и в виде `schema.*` — `RBACGuard` разворачивает такие шаблоны в разрешённые таблицы с учётом метаданных БД.
    **Порядок проверки:** точное `schema.table` → `*` (все таблицы) → `schema.*` (все таблицы схемы) → короткое имя **только если схема в SQL не указана**. Правило без схемы не даёт доступа к одноимённой таблице в другой схеме.
    **COUNT(\*)** не блокируется правилом `excluded_columns`/`allowed_columns`: агрегат не возвращает поля, поэтому `SELECT COUNT(*) FROM t` разрешён даже если у `t` есть скрытые поля.
    **Неквалифицированные колонки при нескольких таблицах:** требуем, чтобы колонка была разрешена **во ВСЕХ** таблицах запроса (или имела wildcard). Это закрывает `SELECT secret_col FROM t1 JOIN t2`, где `t1` разрешает `secret_col`, а `t2` — нет.
-6. **Роль `sql_executor` (право на `/sql`).** Отдельная роль, которая даёт право выполнять `/sql <query>` — ручной SELECT в обход LLM-агента. **⚠️ ОПАСНО:** `/sql` не проходит `check_complexity`, не добавляет авто-LIMIT, и пишется только в `logs/manual_sql.log`. Роль **не даёт** доступа к таблицам — RBAC проверяет таблицы по остальным ролям (viewer/analyst/sales_manager/…). Выдавать **только надёжным пользователям**, понимающим SQL и последствия тяжёлых запросов. При блокировке (`reject_user` / `toggle_user_active`) роли очищаются автоматически, включая `sql_executor`; разблокировка **не** восстанавливает роли — админ назначает заново. Админам роль не нужна — `/sql` доступен автоматически.
+6. **Роль `sql_executor` (право на `/sql`).** Отдельная роль, которая даёт право выполнять `/sql <query>` — ручной SELECT в обход LLM-агента. **⚠️ ОПАСНО:** `/sql` не проходит `check_complexity` и не добавляет авто-LIMIT (см. раздел 9), пишется только в `logs/manual_sql.log`. Роль **не даёт** доступа к таблицам — RBAC проверяет таблицы по остальным ролям (viewer/analyst/sales_manager/…). Выдавать **только надёжным пользователям**, понимающим SQL и последствия тяжёлых запросов. При блокировке (`reject_user` / `toggle_user_active`) роли очищаются автоматически, включая `sql_executor`; разблокировка **не** восстанавливает роли — админ назначает заново. Админам роль не нужна — `/sql` доступен автоматически.
 7. **Защита от P2SQL:** `RBACGuard` блокирует доступ к системным таблицам (`information_schema`, `pg_catalog`, `sqlite_master`) в любом месте AST (включая подзапросы и UNION) — **до** применения RBAC-правил, wildcard `*` их не открывает. `validator.py` работает в режиме fail-closed: любая ошибка парсинга `sqlglot` — отказ.
 8. **Защита админов:** `add_user` игнорирует заявки от env-админов и от пользователей с ролью `admin` в YAML. `delete_user` не удаляет env-админов. `set_user_roles`, `toggle_user_active` не трогают env-админов. `/users` (админ-панель) доступна **только env-админам** (не просто `role: admin` в YAML).
 
@@ -243,6 +253,7 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 ## ⚙️ 8. Инструкция по настройке
 
 ### 8.1. Локальная разработка
+
 1. Установите Python 3.12 и Pipenv.
 2. `pipenv install --dev`.
 3. Создайте `.env` и `config/*.yaml` (см. примеры ниже).
@@ -268,6 +279,7 @@ PIPENV_DONT_LOAD_ENV=1 ADAPTER=cli CLI_USER_ID=<admin_id> pipenv run python -m a
 ```
 
 ### 8.2. Файл `.env` (пример)
+
 ```env
 # Telegram
 TELEGRAM_TOKEN=ваш_токен
@@ -301,6 +313,7 @@ SQL_QUERY_TIMEOUT=15
 LOCK_WAIT_TIMEOUT=5             # ожидание блокировки (MySQL/MariaDB), сек
 MAX_ROWS_IN_RESPONSE=100
 MAX_MESSAGE_LENGTH=4000
+SQL_FETCH_LIMIT=1000            # максимум строк, читаемых из БД (fetchmany)
 SESSION_TTL_SEC=86400       # 24 часа
 AGENT_MAX_STEPS=10          # лимит шагов Agent Loop (минимум 1)
 SHOW_MODEL_IN_RESPONSE=false
@@ -325,6 +338,7 @@ SECURITY_LOG_BACKUP_COUNT=5
 ```
 
 ### 8.3. `config/models.yaml` (пример)
+
 ```yaml
 models:
   tool_calling_model:
@@ -338,6 +352,7 @@ models:
 ```
 
 ### 8.4. `config/databases.yaml` (пример)
+
 ```yaml
 databases:
   db_itzamna:
@@ -366,12 +381,14 @@ databases:
     # Пример: ["SET SESSION sql_mode = 'STRICT_TRANS_TABLES'"]
 ```
 
-**Единые ключи размера пула:** `minsize`/`maxsize` используются и для MySQL, и для PostgreSQL (унификация). Для PostgreSQL они передаются в `asyncpg.create_pool` как `min_size`/`max_size`. Старые ключи `min_size`/`max_size` в конфиге PostgreSQL-БД больше **не читаются** — переименуйте их в `minsize`/`maxsize` (иначе будут взяты дефолты 1/5).
-
 ### 8.5. `config/roles.yaml` — роль `sql_executor`
+
 Роль `sql_executor` даёт право на ручной `/sql`. **⚠️ Опасная роль — выдавать только надёжным пользователям.** Подробное описание (что даёт, чем опасна, кому выдавать) — в самом файле `config/roles.yaml`, в комментарии перед ролью. Админам роль не нужна — `/sql` доступен автоматически.
 
+> ⚠️ Не редактируйте `config/users.yaml` вручную, пока бот работает — используйте `/users`. `_save_users_yaml` делает `os.replace`, и ручные правки могут быть перезаписаны.
+
 Пример `users.yaml` (не коммитить):
+
 ```yaml
 users:
 - id: '123456789'
@@ -382,11 +399,13 @@ users:
 ```
 
 ### 8.6. `config/help.md` — обновлённая справка
+
 `/help` читает файл `config/help.md`. Убедитесь, что в нём упомянуты все команды из раздела 7 (особенно `/stop`, `/models`, `/settings`, `/sql`, `/remember`, `/memory`, `/users` для env-админов, и что `/sql` доступна только с ролью `sql_executor`).
 
 ## ⚠️ 9. Ограничения, риски и TODO
 
 ### 9.1. Принятые архитектурные риски
+
 Это решения, которые **осознанно приняты** и не будут меняться без пересмотра архитектуры. Каждое — с указанием, что делать, если оно станет проблемой.
 
 - **Одновременные запросы:** `asyncio.Lock` на каждого пользователя. Разные пользователи работают параллельно, один — последовательно. **Если станет проблемой:** ограничить число одновременных задач через `asyncio.Semaphore` на пул.
@@ -394,9 +413,10 @@ users:
 - **`databases.yaml` без hot-reload:** пулы соединений создаются один раз при старте. Смена хоста/пароля/`readonly`/`init_statements` требует перезапуска. Остальные конфиги (`models.yaml`, `roles.yaml`, `users.yaml`, `relations.yaml`, `templates.yaml`, `help.md`) перечитываются по mtime. **Если станет проблемой:** `SIGHUP`-хендлер, который пересоздаёт пулы.
 
 ### 9.2. Известные ограничения и TODO
+
 Это **не баги**, а места, где можно улучшить. Часть — осознанные компромиссы, часть — бэклог.
 
-- **`/sql` без `check_complexity`.** Ручной `/sql` не проходит проверку сложности. Причина: `/sql` — это осознанный ручной доступ для админов/аналитиков с ролью `sql_executor`, и ограничивать его теми же порогами, что LLM, нецелесообразно. **Риск:** сотрудник может случайно запустить тяжёлый запрос (`SELECT * FROM huge JOIN huge2`); серверный `MAX_EXECUTION_TIME` прервёт его через `SQL_QUERY_TIMEOUT`, но 15 секунд × N сотрудников = деградация. **TODO:** `EXPLAIN` + предупреждение с подтверждением, либо принудительный `LIMIT` для `/sql` без агрегатов.
+- **`/sql` без `check_complexity`.** Ручной `/sql` не проходит проверку сложности. Причина: `/sql` — это осознанный ручной доступ для админов/аналитиков с ролью `sql_executor`, и ограничивать его теми же порогами, что LLM, нецелесообразно. **Риск:** сотрудник может случайно запустить тяжёлый запрос (`SELECT * FROM huge JOIN huge2`); серверный `MAX_EXECUTION_TIME` прервёт его через `SQL_QUERY_TIMEOUT`, но 15 секунд × N сотрудников = деградация. **auto-LIMIT в `/sql` теперь есть** (как в LLM-ветке: `LIMIT MAX_ROWS_IN_RESPONSE`, если в запросе нет `LIMIT`/`GROUP BY`/агрегата — см. `engine._apply_sql_limit`), а `db_manager.execute_query` читает не более `SQL_FETCH_LIMIT + 1` строк (`fetchmany` вместо `fetchall`) — но `check_complexity` по-прежнему не применяется. **TODO:** `EXPLAIN` + предупреждение с подтверждением, либо применение `check_complexity` и к `/sql`.
 - **`asyncio.wait_for` в MySQL не отменяет серверный запрос.** `aiomysql` не шлёт `KILL QUERY`. Основная защита — `MAX_EXECUTION_TIME` (ставится в `init_command`, включая `readonly=true`). Клиентский `wait_for` — лишь страховка от зависания Python. Задокументировано в `db_manager.execute_query`. **TODO:** нет (это ограничение драйвера, не наше).
 - **`_format_sql_result` дублирует имя колонки для `SELECT 'literal'`.** `SELECT 'SET GLOBAL x'` вернёт `1. 'SET GLOBAL x': SET GLOBAL x`. UX, не безопасность. **TODO:** не дублировать, если имя колонки совпадает со значением.
 - **CLI: `/stop` уходит в LLM.** В отличие от Telegram, `cli_adapter` не обрабатывает `/stop` — используйте `Ctrl+C`. **TODO:** добавить обработку `/stop` в CLI.
@@ -404,6 +424,7 @@ users:
 - **`sql_executor` — опасная роль.** Даёт право на `/sql` в обход `check_complexity` и авто-LIMIT. Выдавать только надёжным пользователям. Подробности — в `config/roles.yaml` (комментарий перед ролью) и разделе 6. **TODO:** нет (осознанное решение — оставить `/sql` без `check_complexity` для ручного доступа).
 
 ### 9.3. Ответственность админа (не баги кода)
+
 Это **не код**, а операционные требования. Бот не может их проверить за админа (кроме `SHOW GRANTS`, где WARNING — но не блокировка).
 
 - **Права БД только `SELECT`.** `readonly: true` не заменяет права БД. При старте бот выполняет `SHOW GRANTS FOR CURRENT_USER()` и пишет WARNING в `security.log`, если у пользователя есть права на запись (включая `FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`). **Проверка не блокирует запуск** — ответственность за гранты всё ещё на админе, но WARNING виден сразу.
@@ -415,12 +436,13 @@ users:
 - **Роль `sql_executor`:** выдавать только надёжным пользователям, понимающим SQL и последствия тяжёлых запросов. При блокировке роли очищаются автоматически; разблокировка не восстанавливает их — назначайте заново осознанно.
 
 ## 🧪 10. Тестирование
-Проект использует `pytest` + `pytest-asyncio`. **Фактическое покрытие: 19 файлов, 196+ тестов** (проверяйте `pytest --collect-only -q tests/` — число может расти). Тесты покрывают:
+
+Проект использует `pytest` + `pytest-asyncio`. **Фактическое покрытие: 19 файлов, 201 тест** (проверяйте `pytest --collect-only -q tests/` — число может расти). Тесты покрывают:
 
 - **Валидатор SQL:** разрешённые/запрещённые запросы, комментарии, multiple statements, null bytes, fail-closed.
 - **RBAC:** qualified-таблицы, `SELECT *` + excluded/allowed, обход через смену схемы, системные таблицы, P2SQL, `COUNT(*)`, неквалифицированные колонки при нескольких таблицах, `expand_select_star`.
-- **SQL-сложность:** JOIN, декартово произведение, глубина подзапросов, UNION, fail-closed, `RecursionError` → `SQLTooComplex`.
-- **Менеджер БД:** `init_command` (readonly + таймаут, MariaDB `max_statement_time`, `init_statements`, warning про `;`, `client_flag` MULTI_STATEMENTS только при `;`), `get_schemas` (explicit, fallback, auto, auto failure → `[]`), `get_table_list`, кэш, PostgreSQL `minsize`/`maxsize`, проверка `SHOW GRANTS` (`tests/test_db_manager_grants.py`: read-only → нет WARNING; `ALL PRIVILEGES`/`INSERT`/`FILE` → WARNING в `security.log`; ошибка `SHOW GRANTS` → WARNING в app-лог, не падает).
+- **SQL-сложность:** JOIN, декартово произведение, глубина подзапросов, UNION, fail-closed, `RecursionError` → `SQLTooComplex`, неподдерживаемые диалекты → `ValueError`.
+- **Менеджер БД:** `init_command` (readonly + таймаут, MariaDB `max_statement_time`, `init_statements`, warning про `;`, `client_flag` MULTI_STATEMENTS только при `;`), `get_schemas` (explicit, fallback, auto, auto failure → `[]`), `get_table_list`, кэш, проверка `SHOW GRANTS` (`tests/test_db_manager_grants.py`: read-only → нет WARNING; `ALL PRIVILEGES`/`INSERT`/`FILE` → WARNING в `security.log`; ошибка `SHOW GRANTS` → WARNING в app-лог, не падает).
 - **Ядро:** `_extract_table_from_sql` и `_extract_last_table_from_history` (кавычки, CTE, подзапросы, системные таблицы), `AGENT_MAX_STEPS`, `expand_select_star` (успех/неудача/логирование), кэш `text_columns`, защита от не-SQL `rbac_msg`.
 - **Проверка доступа:** `tests/test_engine_active_check.py` — `is_active` для всех команд (кроме `/start`, `/help`), роль `sql_executor` в `/sql`, админ обходит проверку.
 - **LLM-клиент:** кэширование клиентов, hot-reload, `_orphaned_clients` в `close()`.
@@ -436,6 +458,7 @@ users:
 Запуск: `pytest -v`.
 
 ## 📋 11. Лицензия и контакты
+
 Проект распространяется под лицензией **MIT**. Полный текст — в файле [`LICENSE.md`](LICENSE.md).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

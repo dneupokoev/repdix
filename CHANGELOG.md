@@ -2,73 +2,59 @@
 
 ## 2026-10-30
 
-### Добавлено
-- db_manager.py: проверка SHOW GRANTS при старте MySQL-пула (WARNING в security.log при правах на запись). README 4.1/9.3 обновлены.
-- session: фоновая очистка просроченных сессий (start_cleanup_task/stop_cleanup_task) + интеграция в main.py — app/core/session.py, app/main.py
-- tests: tests/test_session_cleanup.py — покрытие фоновой очистки TTL
-- tests: tests/test_db_manager_pg_pool_sizes.py — покрытие minsize/maxsize PostgreSQL-пула
-
 ### Изменено
-- db_manager.py: PostgreSQL-пул читает minsize/maxsize (унификация с MySQL). README.md обновлён.
-- config/databases.yaml и README.md: minsize/maxsize для PostgreSQL (унификация).
-- engine.py: кэш text_columns в _format_sql_result (меньше запросов к information_schema).
+- **Удалена поддержка PostgreSQL и SQLite.** Проект теперь работает только с MySQL/MariaDB.
+  - `app/core/db_manager.py` — удалены ветки `postgresql`/`sqlite` (импорты `asyncpg`/`aiosqlite`, `connect`, `execute_query`, `get_schemas`, `_fetch_tables`, `get_table_schema`, `close`).
+  - `app/core/sql_complexity.py` — `_DIALECT_ALIASES` оставлен только `mysql`/`mariadb`; неизвестный диалект → `ValueError`.
+  - `app/core/engine.py` — `_get_default_schema`, `_quote_ident`, `_build_base_prompt` упрощены до MySQL/MariaDB.
+  - `Pipfile` — удалены зависимости `asyncpg`, `aiosqlite`.
+- **`README.md`** — разделы 1, 2, 3, 4, 8.4, 10 актуализированы под MySQL/MariaDB; убраны упоминания PostgreSQL/SQLite.
+
+### Удалено
+- `tests/test_db_manager_pg_pool_sizes.py` — проверял PostgreSQL-пул, которого больше нет.
 
 ### Исправлено
-- _extract_table_from_sql переведён на sqlglot (кавычки, CTE, подзапросы) — app/core/engine.py
-- engine.py: _extract_last_table_from_history переведён на sqlglot (кавычки, CTE, подзапросы).
-- db_manager: get_schemas(auto) при сбое возвращает [] вместо fallback-схемы (LLM не получает ложную картину) — app/core/db_manager.py
-- rbac_guard: неквалифицированные колонки при нескольких таблицах проверяются по всем таблицам (было any, стало all) — app/core/rbac_guard.py
-- validator: DANGEROUS_PATTERNS ищутся только вне строковых литералов (ложные отказы на 'SET GLOBAL x') — app/core/validator.py
-- engine: неудача expand_select_star пишется в audit.log, а не в security.log — app/core/engine.py
-- engine.py: не подставлять в sql результат validate_sql, если это не SQL (защита от изменения контракта).
-- sql_complexity.py: RecursionError в _max_subquery_depth превращается в SQLTooComplex (fail-closed).
-- db_manager.py: _check_mysql_grants ловит FILE/SUPER/PROCESS/RELOAD/SHUTDOWN/EXECUTE.
-- main.py: load_dotenv вызывается до _setup_logging (LOG_MAX_BYTES из .env применяется).
+- `tests/test_engine_active_check.py::test_summary_in_system_prompt` — добавлен мок `get_db_type` после ужесточения `_build_base_prompt`.
 
-## [2026-10-29]
+## 2026-10-29
 
 ### Добавлено
-- Multi-schema: поддержка нескольких схем в одной MySQL-БД. databases.yaml → schemas: auto / список, exclude_schemas. db_manager.get_schemas(), get_table_list() возвращает fully-qualified имена, get_table_schema(db, table, schema).
-- Кэш схемы БД (SCHEMA_CACHE_TTL_SEC, по умолчанию 3600).
-- description в databases.yaml — отображается в /db, /db <name>, /settings, ошибке «БД не найдена».
-- rbac_guard.get_allowed_tables() и get_allowed_schemas() — RBAC по нескольким схемам.
-- /settings — «Доступные схемы», «Схема по умолчанию», «Доступные БД» с описаниями.
-- tests/test_db_manager_schemas.py (9), tests/test_rbac_guard_multi_schema.py (6).
+- **Multi-schema:** поддержка нескольких схем в одной MySQL-БД (`databases.yaml` → `schemas: auto` / список, `exclude_schemas`). `get_table_list()` возвращает fully-qualified имена, `get_table_schema(db, table, schema)`.
+- Кэш схемы БД (`SCHEMA_CACHE_TTL_SEC`, по умолчанию 3600).
+- `description` в `databases.yaml` — отображается в `/db`, `/settings`, ошибке «БД не найдена».
+- `rbac_guard.get_allowed_tables()` и `get_allowed_schemas()` — RBAC по нескольким схемам.
+- `/settings` — «Доступные схемы», «Схема по умолчанию», «Доступные БД» с описаниями.
+- `tests/test_db_manager_schemas.py`, `tests/test_rbac_guard_multi_schema.py`.
 
 ### Изменено
-- db_manager.get_table_list() — breaking change: fully-qualified имена.
-- engine._extract_table_from_sql() — возвращает (schema, table).
-- engine._format_sql_result() — принимает schema.
-- engine._build_base_prompt() — принимает schemas и default_schema.
-- technical_filter.is_technical_qualified() — проверяет все части имени.
+- `db_manager.get_table_list()` — breaking change: fully-qualified имена.
+- `engine._extract_table_from_sql()` — возвращает `(schema, table)`.
+- `engine._format_sql_result()` — принимает `schema`.
+- `engine._build_base_prompt()` — принимает `schemas` и `default_schema`.
+- `technical_filter.is_technical_qualified()` — проверяет все части имени.
 
 ### Исправлено
-- test_format.py — переведён на async API.
-- test_delete_in_comment_is_known_false_positive → test_delete_in_comment_is_ignored.
+- `test_format.py` — переведён на async API.
+- `test_delete_in_comment_is_known_false_positive` → `test_delete_in_comment_is_ignored`.
 
-## [Unreleased]
+## 2026-10-30 (ранее в этот день)
 
-### Added
-- feat: добавить проверку сложности SQL перед выполнением
-- feat: добавь lock timeout для MySQL и MariaDB в db_manager
-- feat: добавить авто-сжатие истории и динамическую схему БД
-- feat: добавь HTML-разметку ответов и parse_mode в Telegram
-- feat: добавить поддержку правил вида "schema.*" в RBACGuard
-- feat: добавить поддержку нескольких схем и кэш метаданных БД
-- feat: добавить фильтрацию технических таблиц и колонок
-- feat: добавить модуль RBACGuard для контроля доступа к таблицам и полям SQL
-- feat: добавить настройку команд бота в telegram_adapter.py
-- feat: добавить FSM-регистрацию пользователей и одобрение заявок администраторами
-- feat: добавить обработку команды /help в engine.py
-- feat: чистый релиз repdix (без секретов)
+### Добавлено
+- `db_manager.py` — проверка `SHOW GRANTS FOR CURRENT_USER()` при старте MySQL-пула: WARNING в `security.log` при правах на запись (`INSERT`/`UPDATE`/`DELETE`/`CREATE`/`DROP`/`ALTER`/`ALL PRIVILEGES`) или админских привилегиях (`FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`). Запуск не блокируется — см. README 4.1.
+- `session.py` — фоновая очистка просроченных сессий (`start_cleanup_task`/`stop_cleanup_task`), интеграция в `main.py`.
+- `tests/test_session_cleanup.py` — покрытие фоновой очистки TTL.
 
-### Fixed
-- fix: исправить обработку SQL-комментариев без пробела после --
-- fix: отправлять статусы с HTML-разметкой без обрезки тегов
-- fix: усилить правило вызова get_table_schema перед execute_sql
+### Изменено
+- `engine.py` — кэш `text_columns` в `_format_sql_result` (меньше запросов к `information_schema`).
 
-### Changed
-- refactor: удалить deep_analysis_model, оставить tool_calling_model
-
-### Documentation
-- docs: обновить комментарии и регулярное выражение для валидации SQL
+### Исправлено
+- `db_manager.py` — `fetchmany` вместо `fetchall` (`SQL_FETCH_LIMIT=1000`); `engine.py` — auto-LIMIT для `/sql`.
+- `_extract_table_from_sql` и `_extract_last_table_from_history` переведены на `sqlglot` (кавычки, CTE, подзапросы) — `app/core/engine.py`.
+- `db_manager.get_schemas(auto)` при сбое возвращает `[]` вместо fallback-схемы — LLM не получает ложную картину.
+- `rbac_guard`: неквалифицированные колонки при нескольких таблицах проверяются по всем таблицам (было `any`, стало `all`).
+- `validator`: `DANGEROUS_PATTERNS` ищутся только вне строковых литералов (ложные отказы на `'SET GLOBAL x'`).
+- `engine`: неудача `expand_select_star` пишется в `audit.log`, а не в `security.log`.
+- `engine.py`: не подставлять в `sql` результат `validate_sql`, если это не SQL (защита от изменения контракта).
+- `sql_complexity.py`: `RecursionError` в `_max_subquery_depth` превращается в `SQLTooComplex` (fail-closed).
+- `db_manager.py`: `_check_mysql_grants` ловит `FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`.
+- `main.py`: `load_dotenv` вызывается до `_setup_logging` (`LOG_MAX_BYTES` из `.env` применяется).

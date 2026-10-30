@@ -65,7 +65,9 @@ def test_empty_rbac_msg_does_not_blank_sql(monkeypatch):
     response = run(engine.process_message(_message("/sql SELECT 1")))
 
     assert db_manager.execute_query.await_count == 1
-    assert db_manager.execute_query.await_args.args[1] == "SELECT 1"
+    # execute_query получает SQL с auto-LIMIT (защита от OOM) —
+    # проверяем начало (rbac_msg не подменяет оригинал), а не точное совпадение.
+    assert db_manager.execute_query.await_args.args[1].startswith("SELECT 1")
     assert response.text
 
 
@@ -77,7 +79,9 @@ def test_error_text_rbac_msg_is_not_used_as_sql(monkeypatch):
     run(engine.process_message(_message("/sql SELECT 1")))
 
     assert db_manager.execute_query.await_count == 1
-    assert db_manager.execute_query.await_args.args[1] == "SELECT 1"
+    # execute_query получает SQL с auto-LIMIT (защита от OOM) —
+    # проверяем начало (rbac_msg не подменяет оригинал), а не точное совпадение.
+    assert db_manager.execute_query.await_args.args[1].startswith("SELECT 1")
 
 
 def test_whitespace_only_rbac_msg_does_not_blank_sql(monkeypatch):
@@ -87,7 +91,9 @@ def test_whitespace_only_rbac_msg_does_not_blank_sql(monkeypatch):
 
     run(engine.process_message(_message("/sql SELECT 1")))
 
-    assert db_manager.execute_query.await_args.args[1] == "SELECT 1"
+    # execute_query получает SQL с auto-LIMIT (защита от OOM) —
+    # проверяем начало (rbac_msg не подменяет оригинал), а не точное совпадение.
+    assert db_manager.execute_query.await_args.args[1].startswith("SELECT 1")
 
 
 def test_normalized_sql_rbac_msg_is_still_used(monkeypatch):
@@ -99,4 +105,6 @@ def test_normalized_sql_rbac_msg_is_still_used(monkeypatch):
     run(engine.process_message(_message("/sql SELECT * FROM t")))
 
     assert db_manager.execute_query.await_count == 1
-    assert db_manager.execute_query.await_args.args[1] == expanded
+    # execute_query получает SQL с auto-LIMIT (защита от OOM) —
+    # проверяем начало (rbac_msg не подменяет оригинал), а не точное совпадение.
+    assert db_manager.execute_query.await_args.args[1].startswith(expanded)

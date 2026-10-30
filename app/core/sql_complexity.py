@@ -1,4 +1,4 @@
-dv_file_version = '261030.02'
+dv_file_version = '261030.03'
 """Проверка сложности SQL-запроса ДО выполнения.
 
 Модуль закрывает класс запросов, которые формально безопасны (проходят
@@ -18,9 +18,9 @@ SQLTooComplex — вызывающий код превращает это в п�
 Fail-closed: если запрос не удалось разобрать sqlglot — это тоже
 SQLTooComplex. Невалидный/обфусцированный SQL не должен доходить до БД.
 
-Диалекты sqlglot: "mysql" (MySQL и MariaDB — отдельного диалекта MariaDB
-в sqlglot нет), "postgres" (PostgreSQL), "sqlite". DBManager возвращает
-"postgresql", поэтому имя диалекта нормализуется (_normalize_dialect).
+Диалект sqlglot: "mysql" (обслуживает и MySQL, и MariaDB — отдельного
+диалекта MariaDB в sqlglot нет). Неизвестный диалект отвергается
+ValueError в _normalize_dialect.
 """
 
 import logging
@@ -32,16 +32,11 @@ from sqlglot import exp
 logger = logging.getLogger(__name__)
 
 
-# DBManager отдаёт типы "mysql"/"postgresql"/"sqlite"; sqlglot ждёт
-# "postgres". MariaDB обслуживается диалектом mysql (отдельного нет).
+# DBManager отдаёт типы "mysql"/"mariadb"; sqlglot обслуживает оба
+# диалектом mysql (отдельного диалекта MariaDB нет).
 _DIALECT_ALIASES: dict[str, str] = {
     "mysql": "mysql",
     "mariadb": "mysql",
-    "postgres": "postgres",
-    "postgresql": "postgres",
-    "pgsql": "postgres",
-    "sqlite": "sqlite",
-    "sqlite3": "sqlite",
 }
 
 
@@ -63,12 +58,19 @@ class SQLTooComplex(Exception):
 def _normalize_dialect(dialect: str) -> str:
     """Приводит имя диалекта к тому, что понимает sqlglot.
 
-    Неизвестные значения возвращаются как есть — sqlglot выбросит
-    ValueError, который check_complexity превратит в SQLTooComplex
-    (fail-closed).
+    Args:
+        dialect: Имя диалекта, полученное от DBManager ("mysql"/"mariadb").
+
+    Returns:
+        Диалект sqlglot ("mysql").
+
+    Raises:
+        ValueError: если диалект не поддерживается.
     """
     key = (dialect or "mysql").strip().lower()
-    return _DIALECT_ALIASES.get(key, key)
+    if key not in _DIALECT_ALIASES:
+        raise ValueError(f"Unsupported dialect: {dialect}")
+    return _DIALECT_ALIASES[key]
 
 
 def _max_subquery_depth(node: exp.Expression, depth: int = 0) -> int:
@@ -106,9 +108,8 @@ def check_complexity(
 
     Args:
         sql: SQL-запрос (только SELECT/WITH — гарантируется validator'ом).
-        dialect: Диалект sqlglot: "mysql" (MySQL/MariaDB), "postgres"
-            (PostgreSQL) или "sqlite". "postgresql" нормализуется в
-            "postgres".
+        dialect: Диалект: "mysql" (MySQL/MariaDB). Другие диалекты
+            не поддерживаются.
         max_joins: Максимально допустимое количество JOIN.
         max_depth: Максимальная глубина вложенности подзапросов.
         max_unions: Максимально допустимое количество UNION.
@@ -120,6 +121,7 @@ def check_complexity(
         SQLTooComplex: если запрос не удалось разобрать (fail-closed) или
             превышен любой из лимитов. Текст исключения пригоден для
             показа пользователю.
+        ValueError: если передан неподдерживаемый диалект.
     """
     dialect_name = _normalize_dialect(dialect)
 

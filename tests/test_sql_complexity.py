@@ -7,7 +7,7 @@ SQLTooComplex ДО выполнения; неразбираемый SQL — то
 
 from __future__ import annotations
 
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 
 import pytest
 
@@ -143,3 +143,15 @@ def test_recursion_error_becomes_sql_too_complex(monkeypatch) -> None:
         check_complexity("SELECT 1", dialect="mysql")
 
     assert "вложенность подзапросов" in exc_info.value.reason.lower()
+
+
+def test_unsupported_dialect_postgres() -> None:
+    """Диалект postgres не поддерживается — ValueError."""
+    with pytest.raises(ValueError):
+        check_complexity("SELECT 1", dialect="postgres")
+
+
+def test_unsupported_dialect_sqlite() -> None:
+    """Диалект sqlite не поддерживается — ValueError."""
+    with pytest.raises(ValueError):
+        check_complexity("SELECT 1", dialect="sqlite")

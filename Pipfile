@@ -5,14 +5,11 @@ name = "pypi"
 
 [packages]
 pymysql = "*"
-psycopg2-binary = "*"
 aiomysql = "*"
 pyyaml = "*"
 python-dotenv = "*"
 openai = "*"
 aiogram = "*"
-asyncpg = "*"
-aiosqlite = "*"
 redis = "*"
 sqlglot = "*"
 

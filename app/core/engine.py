@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261030.13'
+dv_file_version = '261030.17'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -91,9 +91,12 @@ def _build_base_prompt(
     """Собирает системный промпт с учётом диалекта БД.
 
     Args:
-        db_type: "mysql", "postgresql" или "sqlite".
+        db_type: "mysql" (единственный поддерживаемый диалект).
         schemas: Доступные пользователю схемы (multi-schema).
         default_schema: Схема, подставляемая, если в SQL схема не указана.
+
+    Raises:
+        ValueError: Если db_type не "mysql".
     """
     db_type = (db_type or "mysql").lower()
     schemas_line = (
@@ -115,25 +118,8 @@ def _build_base_prompt(
             "Вся необходимая информация о структуре таблиц уже передана тебе в блоке "
             "'Доступные таблицы и поля'. Дополнительные запросы к системным каталогам не требуются. "
         )
-    elif db_type == "postgresql":
-        dialect_line = (
-            "Ты работаешь с базой данных PostgreSQL (диалект PostgreSQL 15+). "
-            "Для условий используй SUM(CASE WHEN ... THEN 1 ELSE 0 END) или FILTER (WHERE ...). "
-        )
-        info_schema_line = (
-            "Структура таблиц уже передана тебе в блоке 'Доступные таблицы и поля'. "
-            "Дополнительные запросы к системным каталогам не требуются. "
-        )
-    else:  # sqlite
-        dialect_line = (
-            "Ты работаешь с базой данных SQLite. "
-            "Для условий используй SUM(CASE WHEN ... THEN 1 ELSE 0 END). "
-        )
-        info_schema_line = (
-            "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО делать запросы к sqlite_master без необходимости. "
-            "Вся необходимая информация о структуре таблиц уже передана тебе в блоке "
-            "'Доступные таблицы и поля'. Дополнительные запросы к системным каталогам не требуются. "
-        )
+    else:
+        raise ValueError(f"Unsupported db_type: {db_type}")
 
     return (
         dialect_line
@@ -306,10 +292,10 @@ class RepdixEngine:
             return default
 
     def _get_default_schema(self, state: SessionState) -> str:
-        """Возвращает имя схемы по умолчанию для текущей БД.
+        """Возвращает имя схемы (базы данных) по умолчанию для MySQL/MariaDB.
 
-        Для MySQL — имя базы (database), для PostgreSQL — database (обычно
-        public, но может быть переопределён), для SQLite — "".
+        Схема берётся из поля database конфига подключения; если оно не
+        задано — используется имя подключения.
         """
         if not self.db_manager or not state.current_db:
             return "public"
@@ -318,18 +304,13 @@ class RepdixEngine:
         except Exception:
             return "public"
         db_type = (db_conf.get('type') or '').lower()
-        if db_type == 'sqlite':
-            # В SQLite схем нет; пустая строка не ломает техническую проверку:
-            # is_technical_qualified() ловит короткое имя таблицы без схемы.
-            return ""
         db_name = (db_conf.get('database') or '').strip()
         if db_name:
             return db_name.lower()
-        # Fallback: для MySQL схема совпадает с именем БД/подключения,
-        # для PostgreSQL по умолчанию public.
+        # Fallback: схема совпадает с именем БД/подключения.
         if db_type == 'mysql':
             return (state.current_db or '').lower()
-        return "public"
+        return (state.current_db or '').lower()
 
     def _get_db_type(self, state: SessionState) -> str:
         """Возвращает тип текущей БД (mysql/postgresql/sqlite)."""
@@ -339,6 +320,23 @@ class RepdixEngine:
             return self.db_manager.get_db_type(state.current_db)
         except Exception:
             return "mysql"
+
+    def _apply_sql_limit(self, sql: str) -> str:
+        """Добавляет авто-LIMIT в ручной /sql-запрос, если его там нет.
+
+        Правила те же, что в LLM-ветке: не трогаем запросы с явным LIMIT,
+        с GROUP BY и с агрегатами (COUNT/SUM/MIN/MAX/AVG) — они возвращают
+        мало строк. Для остальных LIMIT защищает от выгрузки миллионов
+        строк в память (см. SQL_FETCH_LIMIT в db_manager).
+        """
+        lowered = (sql or "").lower()
+        if re.search(r"\blimit\b", lowered):
+            return sql
+        if "group by" in lowered or re.search(
+            r"\b(count|sum|min|max|avg)\s*\(", sql or "", re.IGNORECASE,
+        ):
+            return sql
+        return sql.rstrip() + f" LIMIT {self.max_rows_in_response}"
 
     # ---------- Форматирование результата SQL ----------
     async def _format_sql_result(self, rows: list[dict], db_name: str | None = None,
@@ -534,16 +532,15 @@ class RepdixEngine:
     # ---------- Последняя дата из таблицы ----------
     @staticmethod
     def _quote_ident(name: str, db_type: str) -> str:
-        """Экранирует идентификатор по диалекту БД.
+        """Экранирует идентификатор обратными кавычками (MySQL/MariaDB).
 
-        MySQL — обратные кавычки, PostgreSQL/SQLite — двойные кавычки.
         Экранирование делается даже после валидации: имя может попасть в
         SQL из истории/конфига, защита не должна зависеть от одного regex.
         """
         db_type = (db_type or "mysql").lower()
-        if db_type == "mysql":
-            return "`" + str(name).replace("`", "``") + "`"
-        return '"' + str(name).replace('"', '""') + '"'
+        if db_type != "mysql":
+            raise ValueError(f"Неподдерживаемый диалект БД: {db_type!r}")
+        return "`" + str(name).replace("`", "``") + "`"
 
     async def _try_get_last_date(self, state: SessionState, table_name: str) -> str | None:
         """MAX(<дата-колонка>) для таблицы с учётом схемы и диалекта БД.
@@ -669,6 +666,11 @@ class RepdixEngine:
         Схемы фильтруются через rbac.get_allowed_schemas(), таблицы — через
         rbac.get_allowed_tables(). Для admin разрешены все схемы из
         db_manager.get_schemas().
+
+        Технические (technical_*) таблицы и таблицы технических схем
+        скрываются от ВСЕХ ролей, включая admin: RBAC всё равно блокирует
+        их в SQL, а показ в промпте лишь заставлял модель тратить шаги
+        Agent Loop на заведомо отклоняемые запросы.
 
         Динамическая фильтрация: поля выводятся только для таблиц, релевантных
         запросу (user_query), последним 4 сообщениям истории и последним SQL.
@@ -1538,11 +1540,18 @@ class RepdixEngine:
                     self._log_audit(state, msg, audit_question, audit_answer)
                     return ChatResponse(text=audit_answer)
 
+                # auto-LIMIT (защита от OOM): /sql не проходит
+                # check_complexity и раньше не получал LIMIT, поэтому
+                # "SELECT * FROM huge" тянул весь результат в память.
+                # audit_sql — ДО auto-LIMIT: audit.log и last_sqls содержат то,
+                # что пользователь реально написал (for forensics). sql_for_exec —
+                # после auto-LIMIT и strip_sql_comments (то, что уходит в БД).
+                audit_sql = sql
+                sql = self._apply_sql_limit(sql)
+
                 # В БД — без комментариев (чистое имя колонки в ответе:
                 # cursor.description иначе вернёт "1 -- ; DROP TABLE x").
-                # В аудит и last_sqls — оригинал (for forensics).
                 sql_for_exec = strip_sql_comments(sql)
-                audit_sql = sql
 
                 start_time = time.perf_counter()
                 try:
@@ -1688,6 +1697,14 @@ class RepdixEngine:
                     + last_sqls_block
                     + (("\n\n" + schema) if schema else "")
                 )
+
+                # Резюме предыдущего диалога (auto-compact). Без этого после
+                # 2-3 обрезок истории суть диалога теряется, хотя state.summary
+                # сохраняется в Redis и README 5.4 обещает его использовать.
+                if state.summary:
+                    system_content += (
+                        "\n\nРезюме предыдущего диалога: " + state.summary
+                    )
 
                 # Долгосрочная память: факты, которые пользователь просил
                 # запомнить (/remember). Модель обязана их учитывать.
@@ -2035,16 +2052,16 @@ class RepdixEngine:
                                 re.IGNORECASE,
                             )
                         )
+                        # audit_sql — ДО auto-LIMIT: audit.log и last_sqls содержат оригинал
+                        # (for forensics). sql_for_exec — после auto-LIMIT и strip_sql_comments
+                        # (то, что уходит в БД).
+                        audit_sql = sql
                         if "limit" not in sql.lower() and not has_aggregate:
                             if "text_transcrib" in sql.lower() or "dialog_from_whisper" in sql.lower():
                                 sql = sql.rstrip() + " LIMIT 10"
                             else:
                                 sql = sql.rstrip() + f" LIMIT {self.max_rows_in_response}"
-
-                        # auto-LIMIT добавлен выше; теперь отделяем SQL для
-                        # выполнения (без комментариев) от аудита (оригинал).
                         sql_for_exec = strip_sql_comments(sql)
-                        audit_sql = sql
 
                         start_time = time.perf_counter()
                         try:
@@ -2122,6 +2139,12 @@ class RepdixEngine:
                 final_text = re.sub(r"execute_sql\s*\([^)]*\)", "", final_text).strip()
 
                 await self._save_history(state, user_id, msg.text, final_text)
+
+                # Персистим current_db/current_model/summary/last_sqls в session:{user_id}.
+                # Без этого last_sqls, добавленные в LLM-ветке (state.last_sqls.append),
+                # не сохраняются до следующего /db /model /clear /compact /reset —
+                # после рестарта теряются, хотя README 3.1 обещает обратное.
+                await self._persist_session(state, user_id)
 
                 audit_answer = final_text
                 self._log_audit(state, msg, audit_question, audit_answer)
