@@ -1,6 +1,16 @@
 # app/core/db_manager.py
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite).
+
+Ключевые изменения версии 261030.02:
+- MySQL/MariaDB: в автогенерируемый init_command добавлены
+  "SET SESSION innodb_lock_wait_timeout = <N>" и
+  "SET SESSION lock_wait_timeout = <N>" (N = LOCK_WAIT_TIMEOUT из окружения,
+  по умолчанию 5 секунд). MAX_EXECUTION_TIME/max_statement_time не запускают
+  таймер, пока запрос ждёт блокировку, поэтому ожидание блокировок
+  ограничивается отдельно, на уровне сессии. Работает для MySQL и MariaDB,
+  в том числе при readonly=true. Явно заданный init_statements по-прежнему
+  полностью переопределяет автогенерацию.
 
 Ключевые изменения версии 261030.01:
 - MySQL/MariaDB: при автогенерации init_statements серверный таймаут
@@ -115,6 +125,22 @@ class DBManager:
             )
         except (TypeError, ValueError):
             self.schema_cache_ttl = 3600
+        try:
+            self.lock_wait_timeout = int(
+                os.environ.get("LOCK_WAIT_TIMEOUT", "5")
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение LOCK_WAIT_TIMEOUT=%r, используем 5",
+                os.environ.get("LOCK_WAIT_TIMEOUT"),
+            )
+            self.lock_wait_timeout = 5
+        if self.lock_wait_timeout <= 0:
+            logger.warning(
+                "LOCK_WAIT_TIMEOUT=%s должен быть > 0, используем 5",
+                self.lock_wait_timeout,
+            )
+            self.lock_wait_timeout = 5
         # key -> (monotonic_timestamp, data)
         self._schema_cache: dict[tuple, tuple[float, Any]] = {}
         self.load_config()
@@ -369,6 +395,18 @@ class DBManager:
                     init_stmts.append(
                         f"SET SESSION MAX_EXECUTION_TIME = {mysql_timeout_ms}"
                     )
+                # Ограничение ожидания блокировок на уровне сессии:
+                # MAX_EXECUTION_TIME/max_statement_time не тикают, пока
+                # запрос ждёт блокировку. innodb_lock_wait_timeout — блокировки
+                # InnoDB, lock_wait_timeout — ожидание метаданных (MDL).
+                # Добавляем всегда: и для MySQL, и для MariaDB, и в readonly.
+                init_stmts.append(
+                    "SET SESSION innodb_lock_wait_timeout = "
+                    f"{self.lock_wait_timeout}"
+                )
+                init_stmts.append(
+                    f"SET SESSION lock_wait_timeout = {self.lock_wait_timeout}"
+                )
 
             init_cmd = "; ".join(init_stmts) if init_stmts else None
             if init_cmd:
