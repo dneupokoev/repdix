@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-dv_file_version = '261030.02'
+dv_file_version = '261030.03'
 
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
 from pymysql.constants import CLIENT
@@ -237,3 +237,64 @@ def test_init_statements_no_warning_without_semicolon(
     assert not any(
         "init_statements содержит ';'" in msg for msg in warnings
     ), f"не ожидалось предупреждение про ';', получено: {warnings}"
+
+
+# ----------------------------------------------------------------------
+# MULTI_STATEMENTS: включается только при наличии ';' в init_cmd
+# ----------------------------------------------------------------------
+def _make_mysql_manager_for_flag(tmp_path: Path, db_conf: dict) -> DBManager:
+    """DBManager с временным databases.yaml и единственной БД test_db."""
+    config_path = tmp_path / "databases.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"databases": {"test_db": db_conf}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return DBManager(config_path=str(config_path))
+
+
+def test_client_flag_multi_when_semicolon(tmp_path: Path, monkeypatch) -> None:
+    """MULTI_STATEMENTS включается, когда init_cmd склеен из нескольких SET."""
+    db_conf = _base_conf(readonly=False)
+    db_conf.pop("init_statements", None)
+    manager = _make_mysql_manager_for_flag(tmp_path, db_conf)
+
+    captured: dict = {}
+
+    async def fake_create_pool(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "app.core.db_manager.aiomysql.create_pool", fake_create_pool,
+    )
+
+    asyncio.run(manager.connect("test_db"))
+
+    init_cmd = captured["init_command"]
+    assert init_cmd is not None and ";" in init_cmd
+    assert captured["client_flag"] == CLIENT.MULTI_STATEMENTS
+
+
+def test_client_flag_zero_when_single_statement(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """При одном SET без ';' флаг MULTI_STATEMENTS не выставляется."""
+    db_conf = _base_conf(
+        init_statements=["SET SESSION sql_mode = 'STRICT_TRANS_TABLES'"],
+    )
+    manager = _make_mysql_manager_for_flag(tmp_path, db_conf)
+
+    captured: dict = {}
+
+    async def fake_create_pool(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(
+        "app.core.db_manager.aiomysql.create_pool", fake_create_pool,
+    )
+
+    asyncio.run(manager.connect("test_db"))
+
+    assert captured["init_command"] == "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'"
+    assert captured["client_flag"] == 0

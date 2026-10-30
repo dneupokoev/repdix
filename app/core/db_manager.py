@@ -1,5 +1,5 @@
 # app/core/db_manager.py
-dv_file_version = '261030.05'
+dv_file_version = '261030.07'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite)."""
 
 import asyncio
@@ -340,6 +340,10 @@ class DBManager:
             if init_cmd:
                 logger.debug("DB %s: mysql init_command=%s", name, init_cmd)
 
+            # MULTI_STATEMENTS включаем только если init_cmd содержит ';'
+            # (несколько SET). Иначе не расширяем поверхность атаки.
+            has_multi = bool(init_cmd) and ";" in init_cmd
+
             pool = await aiomysql.create_pool(
                 host=db_conf.get('host', 'localhost'),
                 port=int(db_conf.get('port', 3306)),
@@ -350,7 +354,7 @@ class DBManager:
                 autocommit=True,
                 cursorclass=aiomysql.DictCursor,
                 init_command=init_cmd,
-                client_flag=CLIENT.MULTI_STATEMENTS,
+                client_flag=CLIENT.MULTI_STATEMENTS if has_multi else 0,
                 minsize=int(db_conf.get('minsize', 1)),
                 maxsize=int(db_conf.get('maxsize', 5)),
             )
@@ -364,6 +368,7 @@ class DBManager:
                 user=db_conf.get('user', 'postgres'),
                 password=db_conf.get('password', ''),
                 database=db_conf.get('database', 'postgres'),
+                # Ключи minsize/maxsize едины для MySQL и PostgreSQL (унификация).
                 min_size=int(db_conf.get('minsize', 1)),
                 max_size=int(db_conf.get('maxsize', 5)),
                 command_timeout=self.query_timeout,

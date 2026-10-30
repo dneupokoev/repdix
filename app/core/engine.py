@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261030.08'
+dv_file_version = '261030.11'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -260,6 +260,10 @@ class RepdixEngine:
         self.sql_max_joins = self._env_int("SQL_MAX_JOINS", 5)
         self.sql_max_depth = self._env_int("SQL_MAX_SUBQUERY_DEPTH", 3)
         self.sql_max_unions = self._env_int("SQL_MAX_UNIONS", 3)
+        # Кэш текстовых колонок для _format_sql_result.
+        # Ключ: (db_name, schema or "", table_name). Инвалидация не нужна —
+        # схема меняется редко, а кэш живёт в памяти процесса.
+        self._text_columns_cache: dict[tuple[str, str, str], set[str]] = {}
 
     # ---------- Динамическая схема: настройки ----------
     # Сколько последних сообщений истории учитывать при поиске таблиц
@@ -376,18 +380,26 @@ class RepdixEngine:
         columns = list(display_rows[0].keys())
         lines: list[str] = []
 
-        # Определяем текстовые колонки (для них лимит больше)
-        text_columns = set()
+        # Определяем текстовые колонки (для них лимит больше).
+        # Результат кэшируем по (db, schema, table), чтобы не бить в
+        # get_table_schema / information_schema на каждый формат.
+        text_columns: set[str] = set()
         if db_name and table_name and self.db_manager:
-            try:
-                schema_info = await self.db_manager.get_table_schema(
-                    db_name, table_name, schema,
-                )
-                for col in schema_info:
-                    if col.get("data_type", "").lower() in ("text", "mediumtext", "longtext", "json"):
-                        text_columns.add(col.get("column_name", "").lower())
-            except Exception:
-                pass
+            cache_key = (db_name, schema or "", table_name)
+            cached = self._text_columns_cache.get(cache_key)
+            if cached is not None:
+                text_columns = cached
+            else:
+                try:
+                    schema_info = await self.db_manager.get_table_schema(
+                        db_name, table_name, schema,
+                    )
+                    for col in schema_info:
+                        if col.get("data_type", "").lower() in ("text", "mediumtext", "longtext", "json"):
+                            text_columns.add(col.get("column_name", "").lower())
+                except Exception:
+                    pass
+                self._text_columns_cache[cache_key] = text_columns
 
         max_short = 50
         max_long = 4000
@@ -481,31 +493,39 @@ class RepdixEngine:
         return self.tool_model
 
     # ---------- Извлечение имени таблицы из истории ----------
+    # Системные схемы/таблицы: не подсказываем их как «речь о таблице X».
+    _SYSTEM_TABLES = {"information_schema", "pg_catalog", "sqlite_master"}
+
     def _extract_last_table_from_history(self, state: SessionState) -> str | None:
         """Ищет последнюю таблицу в state.last_sqls, затем в history.
 
-        Возвращает "schema.table", если схема была указана в SQL, иначе
-        короткое имя таблицы.
+        Использует sqlglot (корректно обрабатывает обратные кавычки, CTE,
+        подзапросы). Возвращает "schema.table" или короткое имя.
+        Системные схемы/таблицы (information_schema и т.п.) пропускаются.
         """
 
-        def _extract(content: str) -> str | None:
-            m = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', content, re.IGNORECASE)
-            if not m:
+        def _from_sql(sql: str) -> str | None:
+            extracted = self._extract_table_from_sql(sql)
+            if not extracted:
                 return None
-            raw = m.group(1)
-            if raw.split(".")[-1].lower() in {"information_schema", "sqlite_master"}:
+            schema, table = extracted
+            if not table:
                 return None
-            return raw
+            if table.lower() in self._SYSTEM_TABLES:
+                return None
+            if schema and schema.lower() in self._SYSTEM_TABLES:
+                return None
+            return f"{schema}.{table}" if schema else table
 
         # 1) Проверяем last_sqls в обратном порядке
         for sql in reversed(state.last_sqls):
-            found = _extract(sql)
+            found = _from_sql(str(sql))
             if found:
                 return found
 
         # 2) Ищем в истории
         for msg in reversed(state.history):
-            found = _extract(str(msg.get("content", "")))
+            found = _from_sql(str(msg.get("content", "")))
             if found:
                 return found
 
@@ -1460,10 +1480,16 @@ class RepdixEngine:
                             self._log_audit(state, msg, audit_question, audit_answer)
                             return ChatResponse(text=audit_answer)
                     else:
-                        # rbac_ok=True. Если это была НЕ админ-ветка и validate_sql
-                        # вернул нормализованный sql — подставляем его.
-                        if rbac_msg and rbac_msg != sql:
-                            sql = rbac_msg
+                        # Подставляем rbac_msg в sql только если это действительно
+                        # SQL (начинается с SELECT/WITH).
+                        # Защита от изменения контракта validate_sql.
+                        candidate = (rbac_msg or "").strip()
+                        if (
+                            candidate
+                            and candidate != sql
+                            and candidate.upper().startswith(("SELECT", "WITH"))
+                        ):
+                            sql = candidate
 
                 if state.current_db is None:
                     audit_answer = "Сначала выберите БД командой /db <name>"
@@ -1906,10 +1932,16 @@ class RepdixEngine:
                                     })
                                     continue
                             else:
-                                # rbac_ok=True. Если это была НЕ админ-ветка и validate_sql
-                                # вернул нормализованный sql — подставляем его.
-                                if rbac_msg and rbac_msg != sql:
-                                    sql = rbac_msg
+                                # Подставляем rbac_msg в sql только если это
+                                # действительно SQL (начинается с SELECT/WITH).
+                                # Защита от изменения контракта validate_sql.
+                                candidate = (rbac_msg or "").strip()
+                                if (
+                                    candidate
+                                    and candidate != sql
+                                    and candidate.upper().startswith(("SELECT", "WITH"))
+                                ):
+                                    sql = candidate
 
                         if state.current_db is None:
                             messages.append({

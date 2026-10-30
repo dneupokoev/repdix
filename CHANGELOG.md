@@ -5,13 +5,21 @@
 ### Добавлено
 - session: фоновая очистка просроченных сессий (start_cleanup_task/stop_cleanup_task) + интеграция в main.py — app/core/session.py, app/main.py
 - tests: tests/test_session_cleanup.py — покрытие фоновой очистки TTL
+- tests: tests/test_db_manager_pg_pool_sizes.py — покрытие minsize/maxsize PostgreSQL-пула
+
+### Изменено
+- db_manager.py: PostgreSQL-пул читает minsize/maxsize (унификация с MySQL). README.md обновлён.
+- config/databases.yaml и README.md: minsize/maxsize для PostgreSQL (унификация).
+- engine.py: кэш text_columns в _format_sql_result (меньше запросов к information_schema).
 
 ### Исправлено
 - _extract_table_from_sql переведён на sqlglot (кавычки, CTE, подзапросы) — app/core/engine.py
+- engine.py: _extract_last_table_from_history переведён на sqlglot (кавычки, CTE, подзапросы).
 - db_manager: get_schemas(auto) при сбое возвращает [] вместо fallback-схемы (LLM не получает ложную картину) — app/core/db_manager.py
 - rbac_guard: неквалифицированные колонки при нескольких таблицах проверяются по всем таблицам (было any, стало all) — app/core/rbac_guard.py
 - validator: DANGEROUS_PATTERNS ищутся только вне строковых литералов (ложные отказы на 'SET GLOBAL x') — app/core/validator.py
 - engine: неудача expand_select_star пишется в audit.log, а не в security.log — app/core/engine.py
+- engine.py: не подставлять в sql результат validate_sql, если это не SQL (защита от изменения контракта).
 
 ## [2026-10-29]
 
