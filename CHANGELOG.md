@@ -3,6 +3,7 @@
 ## 2026-10-30
 
 ### Добавлено
+- db_manager.py: проверка SHOW GRANTS при старте MySQL-пула (WARNING в security.log при правах на запись). README 4.1/9.3 обновлены.
 - session: фоновая очистка просроченных сессий (start_cleanup_task/stop_cleanup_task) + интеграция в main.py — app/core/session.py, app/main.py
 - tests: tests/test_session_cleanup.py — покрытие фоновой очистки TTL
 - tests: tests/test_db_manager_pg_pool_sizes.py — покрытие minsize/maxsize PostgreSQL-пула

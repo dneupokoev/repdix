@@ -1,5 +1,5 @@
 # app/core/db_manager.py
-dv_file_version = '261030.07'
+dv_file_version = '261030.08'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite)."""
 
 import asyncio
@@ -359,6 +359,16 @@ class DBManager:
                 maxsize=int(db_conf.get('maxsize', 5)),
             )
             self.pools[name] = pool
+            # Диагностика прав MySQL-пользователя (README 4.1). Проверка
+            # не должна ронять connect(): SHOW GRANTS может быть недоступен.
+            try:
+                await self._check_mysql_grants(name, pool)
+            except Exception as e:
+                logger.warning(
+                    "Ошибка проверки SHOW GRANTS для '%s': %s "
+                    "(не блокирует запуск)",
+                    name, e,
+                )
             return
 
         elif db_type == 'postgresql':
@@ -406,6 +416,63 @@ class DBManager:
 
         else:
             raise NotImplementedError(f"db type {db_type} not supported yet")
+
+    async def _check_mysql_grants(self, name: str, pool) -> None:
+        """Проверяет права MySQL-пользователя через SHOW GRANTS.
+
+        Выполняет ``SHOW GRANTS FOR CURRENT_USER()`` и пишет WARNING в
+        логгер ``security``, если у пользователя БД есть права на запись.
+        Это диагностика, а не защита (README 4.1): запуск не блокируется.
+
+        Если SHOW GRANTS недоступен (нет прав / ошибка сервера) — пишет
+        WARNING в app-логгер, чтобы админ проверил права вручную.
+        Исключения наружу не пробрасываются.
+
+        Args:
+            name: Имя БД из конфигурации (для сообщений).
+            pool: Пул aiomysql, из которого берётся соединение.
+        """
+        security_logger = logging.getLogger("security")
+
+        try:
+            async with pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+                    rows = await cur.fetchall()
+        except Exception as e:
+            logger.warning(
+                "Не удалось проверить SHOW GRANTS для '%s': %s. "
+                "Проверьте права БД вручную (README 4.1).",
+                name, e,
+            )
+            return
+
+        write_keywords = ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER")
+
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            grant = ""
+            for value in row.values():
+                grant = str(value or "")
+                break
+            if not grant:
+                continue
+
+            upper = grant.upper()
+            has_all = "ALL PRIVILEGES" in upper
+            has_write = "ON " in upper and any(
+                re.search(r"\b" + kw + r"\b", upper) for kw in write_keywords
+            )
+            if not (has_all or has_write):
+                continue
+
+            security_logger.warning(
+                "SECURITY: DB user for '%s' has write privileges: %s. "
+                "README 4.1 requires SELECT-only user. "
+                "Readonly mode is NOT a replacement for DB grants.",
+                name, grant,
+            )
 
     # ------------------------------------------------------------------
     # Выполнение запросов

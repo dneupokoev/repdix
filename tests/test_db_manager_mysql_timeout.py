@@ -6,12 +6,12 @@
 
 from __future__ import annotations
 
-dv_file_version = '261030.03'
+dv_file_version = '261030.04'
 
 import asyncio
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import yaml
 from pymysql.constants import CLIENT
@@ -262,11 +262,13 @@ def test_client_flag_multi_when_semicolon(tmp_path: Path, monkeypatch) -> None:
 
     async def fake_create_pool(**kwargs):
         captured.update(kwargs)
-        return MagicMock()
+        return AsyncMock()
 
     monkeypatch.setattr(
         "app.core.db_manager.aiomysql.create_pool", fake_create_pool,
     )
+    # SHOW GRANTS не должен трогать AsyncMock-пул из этого теста.
+    monkeypatch.setattr(DBManager, "_check_mysql_grants", AsyncMock())
 
     asyncio.run(manager.connect("test_db"))
 
@@ -288,11 +290,13 @@ def test_client_flag_zero_when_single_statement(
 
     async def fake_create_pool(**kwargs):
         captured.update(kwargs)
-        return MagicMock()
+        return AsyncMock()
 
     monkeypatch.setattr(
         "app.core.db_manager.aiomysql.create_pool", fake_create_pool,
     )
+    # SHOW GRANTS не должен трогать AsyncMock-пул из этого теста.
+    monkeypatch.setattr(DBManager, "_check_mysql_grants", AsyncMock())
 
     asyncio.run(manager.connect("test_db"))
 
