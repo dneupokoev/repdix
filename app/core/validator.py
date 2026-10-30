@@ -2,6 +2,28 @@
 dv_file_version = '261030.01'
 r"""Валидатор SQL-запросов: проверка безопасности.
 
+Версия 261030.01:
+- Убрана эвристика `if ";" in cleaned` ДО `sqlglot.parse`: она давала
+  ложные срабатывания на легитимных запросах, где `;` стоит внутри
+  SQL-комментария (`SELECT 1 -- ; DROP TABLE x` — типичный вывод LLM).
+  Для аналитического бота это частый сценарий.
+- Основной детектор множественных запросов — `sqlglot.parse(...)`:
+  если вернулось > 1 statement — отказ. `SELECT 1; SELECT 2` даёт
+  2 statement'а и отклоняется, `SELECT 1 -- ; DROP` — один statement.
+- Дополнительная страховка: `_has_statement_separator()` ищет `;`
+  в `check_sql` (после вырезания комментариев), но ВНЕ строковых
+  литералов. Это ловит `SELECT 1; -- DROP` как "multiple statements",
+  не блокируя `SELECT ';' AS x`.
+
+Версия 261030.02:
+- _strip_comments_for_check() переписан на посимвольный сканер вместо
+  регекспов: `--` (в т.ч. без обязательного пробела после, как в SQLite),
+  `#` (MySQL) и `/* */` вырезаются только ВНЕ строковых литералов.
+  Учитываются экранирование (\' \") и удвоение кавычек ('' "").
+  Это исправляет ложные блокировки легитимных запросов вида
+  `SELECT 1 --no space`. Множественные запросы по-прежнему блокируются.
+- Добавлены тесты tests/test_validator_comments.py.
+
 Ключевые изменения версии 261028.13:
 - Исправлен SyntaxError: в raw-string докстринге заменены тройные кавычки
   на одинарные в упоминании r'''...''', чтобы не прерывать raw-string.
@@ -115,15 +137,144 @@ def _strip_comments_for_check(sql: str) -> str:
 
     ВАЖНО: только для анализа, не для выполнения. Вырезаем:
       - /* ... */ (многострочные, вложенные не поддерживаются — как в MySQL)
-      - -- ... \n (однострочные)
+      - -- ... \n (однострочные; пробел после `--` не требуется — SQLite)
       - # ... \n (MySQL)
+
+    Комментарии вырезаются только ВНЕ строковых литералов: ``'...'`` и
+    ``"..."``. Внутри литералов учитываются экранирование (``\'``, ``\"``)
+    и удвоение кавычек (``''``, ``""``). Незакрытый литерал «съедает»
+    остаток строки — это безопасное (fail-closed) поведение: комментарий
+    не будет вырезан, и forbidden keyword, если он есть, поймается.
     """
-    # Многострочные
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    # Однострочные -- и #
-    sql = re.sub(r"(?<![\w-])--(\s[^\n]*)?$", " ", sql, flags=re.MULTILINE)
-    sql = re.sub(r"#[^\n]*", " ", sql)
-    return sql
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    quote: str | None = None  # текущий открытый литерал: ' или "
+
+    while i < n:
+        ch = sql[i]
+
+        if quote is not None:
+            # Внутри строкового литерала — копируем всё как есть
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                # Экранирование: \' или \" (и любые \x) — переносим парой
+                out.append(sql[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                # Удвоенная кавычка внутри литерала ('' или "") не закрывает
+                if i + 1 < n and sql[i + 1] == quote:
+                    out.append(sql[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        # Вне литералов
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            # Однострочный комментарий -- ... до конца строки
+            nl = sql.find("\n", i)
+            out.append(" ")
+            i = n if nl == -1 else nl
+            continue
+
+        if ch == "#":
+            # MySQL-комментарий # ... до конца строки
+            nl = sql.find("\n", i)
+            out.append(" ")
+            i = n if nl == -1 else nl
+            continue
+
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            # Многострочный комментарий /* ... */ (без вложенности)
+            end = sql.find("*/", i + 2)
+            out.append(" ")
+            i = n if end == -1 else end + 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _has_statement_separator(sql: str) -> bool:
+    """True, если `;` встречается ВНЕ строковых литералов.
+
+    Страховка после вырезания комментариев: sqlglot может счесть
+    ``SELECT 1; -- DROP`` одним statement'ом (после `;` идёт только
+    комментарий), но для безопасности такой ввод отклоняем. При этом
+    `;` внутри строковых литералов (``'a;b'``) считаем обычным символом.
+
+    Учитываются экранирование (``\\'``, ``\\"``) и удвоение кавычек
+    (``''``, ``""``).
+
+    Args:
+        sql: Строка SQL без комментариев (например, результат
+            `_strip_comments_for_check`).
+
+    Returns:
+        True, если найден `;` вне литералов.
+    """
+    quote: str | None = None
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        ch = sql[i]
+
+        if quote is not None:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == ";":
+            return True
+        i += 1
+
+    return False
+
+
+def strip_sql_comments(sql: str) -> str:
+    """Удаляет SQL-комментарии ВНЕ строковых литералов.
+
+    В отличие от _strip_comments_for_check, эта функция
+    предназначена для ПЕРЕДАЧИ SQL В БД: она возвращает
+    SQL без комментариев --, #, /* */ (вне литералов), но
+    сохраняет все литералы, экранирование и удвоение кавычек.
+
+    Если после вырезания комментариев остаётся пустая строка,
+    возвращает исходный sql (не хотим отправлять в БД пустоту).
+
+    Args:
+        sql: Строка с SQL-запросом.
+
+    Returns:
+        SQL без комментариев (stripped) либо исходная строка, если
+        после вырезания ничего не осталось.
+    """
+    cleaned = _strip_comments_for_check(sql)
+    if not cleaned.strip():
+        return sql
+    # убираем "висящие" пробелы от вырезанных комментариев
+    return cleaned.strip()
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
@@ -151,11 +302,11 @@ def validate_sql(sql: str) -> tuple[bool, str]:
     if not cleaned:
         return False, "empty sql after cleanup"
 
-    # Проверка на множественные запросы: любая ; в середине — отказ
-    # (после удаления завершающей ;)
-    if ";" in cleaned:
-        return False, "multiple statements"
-
+    # Множественные запросы определяются через sqlglot.parse ниже
+    # (len(statements) > 1). Проверка `";" in cleaned` здесь больше не
+    # используется: она ложно блокировала запросы, где `;` находится
+    # внутри SQL-комментария (`SELECT 1 -- ; DROP TABLE x`).
+    #
     # Fail-closed: SQL должен успешно разбираться sqlglot. Если парсер
     # не справился — отклоняем: невалидный/обфусцированный SQL может
     # обойти регексп-проверки ниже (prompt injection).
@@ -178,6 +329,13 @@ def validate_sql(sql: str) -> tuple[bool, str]:
 
     if not check_upper:
         return False, "empty sql after comment removal"
+
+    # Страховка: `;` вне строковых литералов в тексте без комментариев
+    # означает второй statement. sqlglot уже отсёк явные случаи, но
+    # `SELECT 1; -- DROP` он считает одним statement'ом (после `;` идёт
+    # только комментарий), поэтому сохраняем строгий отказ для него.
+    if _has_statement_separator(check_sql):
+        return False, "multiple statements"
 
     # Проверка начала запроса (SELECT или WITH)
     if not (check_upper.startswith("SELECT") or check_upper.startswith("WITH")):

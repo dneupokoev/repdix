@@ -3,6 +3,17 @@ dv_file_version = '261030.01'
 """Клиент для работы с LLM через OpenAI-совместимый API.
 
 Ключевые изменения версии 261030.01:
+- chat(): условие tools-fallback сделано точным. Раньше проверка
+  `"tools" in err_lower or "tool" in err_lower` ловила подстроку "tool"
+  почти в любом сообщении об ошибке (tool_calls, tool_choice, имя модели
+  с "tool") и приводила к тихому повтору без инструментов на несвязанную
+  ошибку (rate limit, timeout). Теперь tools-fallback требует либо
+  "tools" в тексте ошибки, либо "tool" вместе с одним из маркеров
+  ("not supported", "does not support", "unsupported",
+  "unknown parameter", "invalid parameter"). В остальных случаях
+  исключение пробрасывается как раньше.
+
+Ключевые изменения версии 261030.01:
 - chat(): блок передачи max_tokens сделан строже. Раньше проверка была
   `if max_tokens:` — значения 0 и "0" молча отбрасывались, а нечисловое
   значение приводило к неинформативному падению. Теперь: `is not None`,
@@ -367,8 +378,26 @@ class LLMClient:
                 kwargs.pop("tool_choice", None)
                 response = await client.chat.completions.create(**kwargs)
                 return response.model_dump()
-            # Fallback: некоторые модели не принимают tools вообще
-            if ("tools" in err_lower or "tool" in err_lower) and kwargs.get("tools") is not NOT_GIVEN:
+            # Fallback: некоторые модели не принимают tools вообще.
+            # Подстрока "tool" сама по себе слишком широкая (tool_calls,
+            # tool_choice, имя модели с "tool"), поэтому для случая,
+            # когда явного "tools" в тексте нет, требуем маркер
+            # неподдерживаемого/неизвестного параметра.
+            _unsupported_markers = (
+                "not supported",
+                "does not support",
+                "unsupported",
+                "unknown parameter",
+                "invalid parameter",
+            )
+            tools_fallback = (
+                "tools" in err_lower
+                or (
+                    "tool" in err_lower
+                    and any(marker in err_lower for marker in _unsupported_markers)
+                )
+            )
+            if tools_fallback and kwargs.get("tools") is not NOT_GIVEN:
                 logger.warning(
                     "LLM не поддерживает tools, повторяем без них: %s", e,
                 )

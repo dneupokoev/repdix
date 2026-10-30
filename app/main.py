@@ -141,11 +141,34 @@ async def _init_services() -> tuple[DBManager, LLMClient, CacheManager, UserMana
 # ----------------------------------------------------------------------
 def _build_adapter(engine: RepdixEngine):
     """Создаёт адаптер по ADAPTER из .env. Возвращает None, если не удалось."""
-    adapter_name = (os.environ.get("ADAPTER") or "cli").lower()
+    raw_adapter = os.environ.get("ADAPTER")
+    adapter_name = (raw_adapter or "cli").lower()
+    logger.info(
+        "Выбор адаптера: ADAPTER=%r (effective=%r). "
+        "TELEGRAM_TOKEN задан: %s. CLI_USER_ID: %r. "
+        "Если это не то, что вы ожидали — pipenv run перезаписывает "
+        "env-переменные из .env; для CLI используйте прямой запуск: "
+        ".venv/bin/python -m app.main",
+        raw_adapter,
+        adapter_name,
+        bool(os.environ.get("TELEGRAM_TOKEN")),
+        os.environ.get("CLI_USER_ID"),
+    )
 
     if adapter_name == "telegram":
+        if os.environ.get("CLI_USER_ID"):
+            logger.warning(
+                "ADAPTER=telegram, но CLI_USER_ID задан (%r). "
+                "Возможно, вы хотели CLI: pipenv run загружает .env "
+                "и перезаписывает env-переменные из командной строки. "
+                "Для CLI используйте: env ADAPTER=cli ... "
+                ".venv/bin/python -m app.main",
+                os.environ.get("CLI_USER_ID"),
+            )
         if not os.environ.get("TELEGRAM_TOKEN"):
-            logger.error("ADAPTER=telegram, но TELEGRAM_TOKEN не задан в .env")
+            logger.error(
+                "ADAPTER=telegram, но TELEGRAM_TOKEN не задан в .env"
+            )
             return None
         return TelegramAdapter(engine)
 
@@ -164,9 +187,23 @@ def _build_adapter(engine: RepdixEngine):
 # ----------------------------------------------------------------------
 async def main() -> None:
     """Инициализация ядра и запуск выбранного адаптера."""
-    load_dotenv()
+    # ВАЖНО: логирование включаем ДО load_dotenv(), чтобы увидеть,
+    # что было в env до и после загрузки .env. pipenv run грузит .env
+    # раньше, чем main(), поэтому override=False не «спасает» — но
+    # debug-лог ниже покажет это явно.
     _setup_logging()
 
+    logger.info(
+        "DEBUG main: ADAPTER до load_dotenv=%r",
+        os.environ.get("ADAPTER"),
+    )
+    # override=False — документированное поведение python-dotenv:
+    # явные env-переменные НЕ перезаписываются.
+    load_dotenv(override=False)
+    logger.info(
+        "DEBUG main: ADAPTER после load_dotenv=%r",
+        os.environ.get("ADAPTER"),
+    )
     logger.info("repdix запускается")
 
     # --- Сервисы ---
@@ -187,6 +224,10 @@ async def main() -> None:
 
     # --- Адаптер ---
     adapter = _build_adapter(engine)
+    logger.info(
+        "Адаптер создан: %s",
+        type(adapter).__name__ if adapter is not None else None,
+    )
     if adapter is None:
         logger.error("Не удалось создать адаптер — завершение")
         await _shutdown(engine, None)

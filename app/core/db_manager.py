@@ -1,13 +1,33 @@
 # app/core/db_manager.py
-dv_file_version = '261029.03'
+dv_file_version = '261030.01'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite).
+
+Ключевые изменения версии 261030.01:
+- MySQL/MariaDB: при автогенерации init_statements серверный таймаут
+  ставится ВСЕГДА, независимо от readonly. Для MariaDB это
+  "SET SESSION max_statement_time = <SQL_QUERY_TIMEOUT>" (в секундах),
+  для MySQL — "SET SESSION MAX_EXECUTION_TIME = <мс>". Ранее для
+  MariaDB при readonly=false серверный таймаут не выставлялся вообще.
+  transaction_read_only по-прежнему ставится только при readonly=true.
+- Явно заданный непустой init_statements полностью переопределяет
+  автогенерацию (без изменений).
+
+Ключевые изменения версии 261029.04:
+- MySQL: init_command теперь может содержать НЕСКОЛЬКО SET-запросов через
+  "; " (пул создаётся с client_flag=CLIENT.MULTI_STATEMENTS). Благодаря
+  этому при readonly=true всё равно ставится MAX_EXECUTION_TIME.
+- MySQL: новый опциональный параметр конфига `init_statements` (список
+  строк). Если он задан — используется он вместо автогенерируемых SET.
+- MySQL/MariaDB: при readonly=true ставится
+  "SET SESSION transaction_read_only = 1" + серверный таймаут
+  (MAX_EXECUTION_TIME в мс для MySQL, max_statement_time в секундах для
+  MariaDB). Для MariaDB без readonly серверный таймаут не ставится.
 
 Ключевые изменения версии 261029.03:
 - MySQL: execute_query обёрнут в asyncio.wait_for(timeout=SQL_QUERY_TIMEOUT+2).
-  В режиме readonly=true MAX_EXECUTION_TIME не ставится, поэтому серверный
-  таймаут не работает — теперь клиентский таймаут гарантирует, что бот не
-  зависнет навсегда. При срабатывании выбрасывается TimeoutError с тем же
-  текстом, что и для SQLite.
+  Клиентский таймаут — последняя линия защиты, если серверный таймаут
+  (MAX_EXECUTION_TIME) не применился. При срабатывании выбрасывается
+  TimeoutError с тем же текстом, что и для SQLite.
 
 Ключевые изменения версии 261029.02:
 - Поддержка нескольких схем в одной MySQL-БД: конфиг `schemas` (список или
@@ -69,6 +89,7 @@ import aiosqlite
 import aiomysql
 import asyncpg
 import yaml
+from pymysql.constants import CLIENT
 
 from app.core.technical_filter import is_technical
 
@@ -312,24 +333,46 @@ class DBManager:
         if db_type == 'mysql':
             # init_command выполняется при создании каждого соединения в пуле.
             # Это дешевле, чем слать SET на каждый execute_query.
-            is_mariadb = db_conf.get('is_mariadb', False)
+            # Multi-statement включается через client_flag ниже, поэтому
+            # в init_command можно объединять несколько SET через "; ".
+            is_mariadb = bool(db_conf.get('is_mariadb', False))
             is_readonly = db_conf.get('readonly') is True
+            mysql_timeout_ms = self.query_timeout * 1000
 
-            # aiomysql не поддерживает multi-statement в init_command.
-            # Поэтому выбираем ОДИН SET-запрос.
-            # ВАЖНО: при readonly=True и MySQL (не MariaDB) MAX_EXECUTION_TIME
-            # НЕ ставится — таймаут запроса на уровне БД не работает.
-            # Если нужен и readonly, и таймаут — используйте пользователя БД
-            # с правами только на SELECT (рекомендуется), либо снимите readonly
-            # и полагайтесь на RBAC + validator.
-            if is_readonly and not is_mariadb:
-                init_cmd = "SET SESSION transaction_read_only = 1"
-            elif not is_readonly and not is_mariadb:
-                init_cmd = f"SET SESSION MAX_EXECUTION_TIME={self.query_timeout * 1000}"
+            init_statements_conf = db_conf.get('init_statements')
+            if init_statements_conf is not None and not isinstance(init_statements_conf, list):
+                logger.warning(
+                    "DB %s: init_statements должен быть списком, получено %r — игнорируем",
+                    name, type(init_statements_conf),
+                )
+                init_statements_conf = None
+
+            if init_statements_conf:
+                init_stmts = [
+                    str(stmt).strip() for stmt in init_statements_conf
+                    if str(stmt).strip()
+                ]
             else:
-                # MariaDB: readonly проверяется на уровне пользователя БД,
-                # MAX_EXECUTION_TIME не поддерживается.
-                init_cmd = None
+                # Автогенерируемые SET-запросы.
+                # readonly → запрет записи на уровне сессии + серверный таймаут.
+                # MariaDB не понимает MAX_EXECUTION_TIME — для неё
+                # max_statement_time (в СЕКУНДАХ). max_statement_time не
+                # требует прав на запись, поэтому ставим его всегда.
+                init_stmts = []
+                if is_readonly:
+                    init_stmts.append("SET SESSION transaction_read_only = 1")
+                if is_mariadb:
+                    init_stmts.append(
+                        f"SET SESSION max_statement_time = {self.query_timeout}"
+                    )
+                else:
+                    init_stmts.append(
+                        f"SET SESSION MAX_EXECUTION_TIME = {mysql_timeout_ms}"
+                    )
+
+            init_cmd = "; ".join(init_stmts) if init_stmts else None
+            if init_cmd:
+                logger.debug("DB %s: mysql init_command=%s", name, init_cmd)
 
             pool = await aiomysql.create_pool(
                 host=db_conf.get('host', 'localhost'),
@@ -341,6 +384,7 @@ class DBManager:
                 autocommit=True,
                 cursorclass=aiomysql.DictCursor,
                 init_command=init_cmd,
+                client_flag=CLIENT.MULTI_STATEMENTS,
                 minsize=int(db_conf.get('minsize', 1)),
                 maxsize=int(db_conf.get('maxsize', 5)),
             )

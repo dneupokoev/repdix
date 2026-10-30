@@ -2,8 +2,8 @@
 
 ## Назначение
 `app/main.py` — точка входа приложения **repdix**. Модуль:
-- загружает переменные окружения из `.env`;
 - настраивает консольное логирование и файловые логи `audit.log` / `security.log` с ротацией;
+- загружает переменные окружения из `.env`;
 - инициализирует `DBManager`, `LLMClient`, `CacheManager`, `UserManager`;
 - создаёт `RepdixEngine`;
 - выбирает и запускает адаптер `cli` или `telegram`;
@@ -20,37 +20,43 @@
 - `_setup_logging() -> None`
   - Настраивает `logging.basicConfig` уровня `INFO`.
   - Создаёт директорию `logs` через `os.makedirs(..., exist_ok=True)`.
-  - При ошибке создания директории пишет ошибку и отключает файловые логи.
+  - При `OSError` пишет ошибку и warning, после чего отключает файловые логи; консольное логирование остаётся.
   - Настраивает логгер `audit` с `RotatingFileHandler` для `logs/audit.log`.
   - Настраивает логгер `security` с `RotatingFileHandler` для `logs/security.log`.
   - Для файловых логов использует `delay=True`, `encoding='utf-8'`, формат `%(message)s`, `propagate=False`.
   - Размеры ротации берёт из env:
     - `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` — audit, по умолчанию 100 MB × 5;
     - `SECURITY_LOG_MAX_BYTES`, `SECURITY_LOG_BACKUP_COUNT` — security, по умолчанию 50 MB × 5.
+  - Числовые env-переменные приводятся через `int(...)`; при некорректном значении будет исключение.
 
 - `async _init_services() -> tuple[DBManager, LLMClient, CacheManager, UserManager]`
   - Создаёт `DBManager()`.
   - Создаёт `LLMClient(default_model=os.environ.get("DEFAULT_MODEL", "tool_calling_model"))`.
-  - Создаёт `CacheManager(host=..., port=..., password=...)` по env `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`.
+  - Создаёт `CacheManager(host=..., port=..., password=...)` по env `REDIS_HOST` (по умолчанию `localhost`), `REDIS_PORT` (по умолчанию `6379`), `REDIS_PASSWORD` (по умолчанию `None`).
   - Вызывает `await cache_manager.ping()`.
     - При успехе логирует `Redis: подключение OK`.
-    - При неудаче пишет warning и продолжает запуск.
+    - При `False` пишет warning и продолжает запуск.
+    - Исключение из `ping()` внутри `_init_services()` не перехватывается; оно приведёт к выходу через обработку в `main()`.
   - Создаёт `UserManager()` и вызывает `await user_manager.sync_admins()`.
   - Возвращает кортеж инициализированных сервисов.
 
 - `_build_adapter(engine: RepdixEngine)`
-  - Читает `ADAPTER`, по умолчанию `cli`.
-  - Для `telegram` проверяет наличие `TELEGRAM_TOKEN`; если токена нет — логирует ошибку и возвращает `None`.
-  - Для `telegram` возвращает `TelegramAdapter(engine)`.
+  - Читает `ADAPTER`, по умолчанию `cli`; приводит значение к нижнему регистру.
+  - Логирует исходное и эффективное значение `ADAPTER`, наличие `TELEGRAM_TOKEN`, значение `CLI_USER_ID` и предупреждение про особенности `pipenv run` / `.env`.
+  - Для `telegram`:
+    - при заданном `CLI_USER_ID` логирует warning;
+    - если `TELEGRAM_TOKEN` не задан — логирует ошибку и возвращает `None`;
+    - иначе возвращает `TelegramAdapter(engine)`.
   - Для `cli` возвращает `CLIAdapter(engine)`.
   - Для неизвестного значения логирует ошибку и возвращает `CLIAdapter(engine)` как fallback.
 
 - `async main() -> None`
-  - Вызывает `load_dotenv()` и `_setup_logging()`.
-  - Логирует `repdix запускается`.
+  - Сначала вызывает `_setup_logging()`, затем логирует `ADAPTER` до `load_dotenv()`.
+  - Вызывает `load_dotenv(override=False)`: явные env-переменные не перезаписываются.
+  - Логирует `ADAPTER` после `load_dotenv()` и сообщение `repdix запускается`.
   - Инициализирует сервисы через `_init_services()`; при исключении логирует его и завершает процесс с `sys.exit(1)`.
   - Создаёт `RepdixEngine(db_manager=..., llm_client=..., cache_manager=..., default_db=os.environ.get("DEFAULT_DB"), user_manager=...)`.
-  - Создаёт адаптер через `_build_adapter(engine)`.
+  - Создаёт адаптер через `_build_adapter(engine)` и логирует его тип.
   - Если адаптер не создан — логирует ошибку, вызывает `_shutdown(engine, None)` и завершает процесс с `sys.exit(1)`.
   - Запускает `await adapter.start()`.
   - Перехватывает `KeyboardInterrupt` / `asyncio.CancelledError` и другие исключения.
@@ -103,11 +109,13 @@
 ## Поведение и ограничения
 - При неизвестном `ADAPTER` приложение не завершается, а переключается на `CLIAdapter` после `logger.error`.
 - При `ADAPTER=telegram` без `TELEGRAM_TOKEN` адаптер не создаётся, выполняется shutdown и процесс завершается с кодом `1`.
-- Проверка Redis в docstring названа fail-fast, но фактически при неудачном `ping()` приложение только пишет warning и продолжает запуск.
+- Проверка Redis в docstring названа fail-fast, но фактически при неудачном `ping()` приложение только пишет warning и продолжает запуск; исключение из `ping()` не перехватывается в `_init_services()`.
 - Числовые env-переменные приводятся через `int(...)`; при некорректном значении будет исключение.
 - Если директорию `logs` создать не удалось, файловые audit/security-логи отключаются, консольное логирование остаётся.
 - Shutdown устойчив к ошибкам: исключения при закрытии ресурсов логируются, но не прерывают завершение.
 - Собственных классов модуль не определяет; все классы импортируются из других модулей.
+- `_shutdown()` вызывает `engine.sessions.clear_all()` синхронно, без `await`.
+- `_setup_logging()` вызывается до `load_dotenv()`, чтобы видеть исходные env-переменные до загрузки `.env`.
 
 ## Сохранённая существующая документация
-Существующая документация в предоставленном материале отсутствует, поэтому сохраняемых разделов нет.
+В исходной документации отмечалось, что сохраняемых разделов нет.

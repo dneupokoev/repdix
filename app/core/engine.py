@@ -1,6 +1,50 @@
 # app/core/engine.py
-dv_file_version = '261029.23'
+dv_file_version = '261030.01'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
+
+Ключевые изменения версии 261030.01:
+- AGENT_MAX_STEPS читается из env (fallback 10, минимум 1); при выходе
+  по лимиту пишется WARNING "Agent loop reached max_steps".
+- Состояние сессии (current_db, current_model, summary, last_sqls)
+  зеркалится в Redis-ключе session:{user_id} через _persist_session();
+  читается при входе в process_message.
+- default_schema пересчитывается ПОСЛЕ загрузки кэша — раньше для MySQL
+  он был всегда "public".
+- Исправлен admin-bypass в /sql и tool_call execute_sql: при отказе RBAC
+  для админа явно ставится rbac_ok=True (раньше управление проваливалось
+  в выполнение без нормализации).
+- get_relations в tool-loop фильтрует технические таблицы/колонки и
+  проверяет RBAC через validate_sql.
+- _try_get_last_date: schema и имена колонок/таблиц квотируются по
+  диалекту БД (_quote_ident), для MySQL — обратные кавычки
+  (SELECT MAX(`date`) ...).
+- _try_expand_select_star: при неудаче/повторном отказе пишет
+  log_violation (expand_select_star failed / rejected).
+- Защита от _FakeState в тестах: user_id_for_log через getattr.
+
+Ключевые изменения версии 261030.04:
+- Состояние сессии зеркалится в Redis: ключ session:{user_id}
+  ({"current_db", "current_model", "summary", "last_sqls"}, TTL 24 часа).
+  Пишется через _persist_session() в /db <name>, /model <name>, /compact,
+  /reset, /clear; читается при входе в process_message (битый/отсутствующий
+  ключ не сбрасывает значения, уже установленные в этой сессии).
+- default_schema пересчитывается ПОСЛЕ загрузки кэша: раньше он вычислялся
+  до восстановления current_db (всегда None) и для MySQL получалось
+  "public" вместо имени базы.
+- Восстановленная БД проверяется по db_manager.get_db_names(): удалённая
+  из конфига БД не попадает в состояние.
+
+Ключевые изменения версии 261030.03:
+- SELECT * по таблице с ограниченным набором полей больше не тупик: если
+  validate_sql отказал именно из-за звёздочки, движок пробует развернуть её
+  в явный список разрешённых полей (_try_expand_select_star →
+  rbac.expand_select_star). Развёрнутый запрос повторно валидируется RBAC,
+  факт развёртывания пишется в audit.log (type=select_star_expanded).
+- Полный список полей таблицы (для excluded_columns) подгружается асинхронно
+  заранее через rbac.extract_tables + db_manager.get_table_schema, потому что
+  expand_select_star синхронный.
+- Сообщения отказа по SELECT * теперь перечисляют разрешённые поля — LLM
+  видит, что нужно переписать, а не просто «запрещено».
 
 Ключевые изменения версии 261029.23:
 - Удалён инструмент execute_template: он работал только для MySQL и создавал
@@ -164,7 +208,7 @@ import yaml
 
 from app.core.session import SessionState, SessionStore
 from app.core.technical_filter import is_technical, is_technical_qualified
-from app.core.validator import log_violation, validate_sql
+from app.core.validator import log_violation, strip_sql_comments, validate_sql
 from app.core.rbac_guard import RBACGuard
 from app.interfaces.base import ChatMessage, ChatResponse
 
@@ -387,6 +431,18 @@ class RepdixEngine:
         self.show_model_in_response = os.environ.get("SHOW_MODEL_IN_RESPONSE", "false").lower() == "true"
         self.max_rows_in_response = int(os.environ.get("MAX_ROWS_IN_RESPONSE") or "100")
         self.max_message_length = int(os.environ.get("MAX_MESSAGE_LENGTH") or "4000")
+        # AGENT_MAX_STEPS: лимит шагов агентского цикла (README, .env).
+        # Нечисловое значение не должно ронять инициализацию — fallback 10.
+        try:
+            self.agent_max_steps = max(
+                1, int(os.environ.get("AGENT_MAX_STEPS") or "10")
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение AGENT_MAX_STEPS=%r, использую 10",
+                os.environ.get("AGENT_MAX_STEPS"),
+            )
+            self.agent_max_steps = 10
 
     # ---------- Динамическая схема: настройки ----------
     # Сколько последних сообщений истории учитывать при поиске таблиц
@@ -546,18 +602,6 @@ class RepdixEngine:
             return schema.lower(), table
         return (default_schema or "").lower(), raw
 
-    def _shorten_text(self, text: str, max_len: int = 120) -> str:
-        """Обрезает текст до max_len символов, удаляя вступления."""
-        if not text:
-            return ""
-        text = re.sub(r'\s+', ' ', text).strip()
-        for prefix in ["извините, ", "к сожалению, ", "прошу прощения, ", "я не могу, "]:
-            if text.lower().startswith(prefix):
-                text = text[len(prefix):]
-        if len(text) > max_len:
-            text = text[:max_len].rsplit(' ', 1)[0] + "..."
-        return text
-
     # ---------- Роутинг моделей ----------
     def _route_query(self, text: str, state: SessionState) -> str:
         """Возвращает выбранную пользователем модель или tool_model по умолчанию."""
@@ -597,22 +641,71 @@ class RepdixEngine:
         return None
 
     # ---------- Последняя дата из таблицы ----------
+    @staticmethod
+    def _quote_ident(name: str, db_type: str) -> str:
+        """Экранирует идентификатор по диалекту БД.
+
+        MySQL — обратные кавычки, PostgreSQL/SQLite — двойные кавычки.
+        Экранирование делается даже после валидации: имя может попасть в
+        SQL из истории/конфига, защита не должна зависеть от одного regex.
+        """
+        db_type = (db_type or "mysql").lower()
+        if db_type == "mysql":
+            return "`" + str(name).replace("`", "``") + "`"
+        return '"' + str(name).replace('"', '""') + '"'
+
     async def _try_get_last_date(self, state: SessionState, table_name: str) -> str | None:
+        """MAX(<дата-колонка>) для таблицы с учётом схемы и диалекта БД.
+
+        table_name может быть как коротким ("dialogs"), так и
+        fully-qualified ("db_itzamna.dialogs"). Если схема не указана —
+        подставляется схема по умолчанию текущей БД.
+        """
         if state.current_db is None or self.db_manager is None:
             return None
+
+        schema_part, table_part = self._split_qualified(
+            table_name, self._get_default_schema(state),
+        )
+
+        # Имена попадают в SQL: пускаем только безопасные идентификаторы.
+        _ident_re = r"[a-zA-Z0-9_]+"
+        if not re.fullmatch(_ident_re, table_part or ""):
+            return None
+        if schema_part and not re.fullmatch(_ident_re, schema_part):
+            return None
+
         try:
-            columns = await self.db_manager.get_table_schema(state.current_db, table_name)
+            columns = await self.db_manager.get_table_schema(
+                state.current_db, table_part, schema_part or None,
+            )
         except Exception:
             return None
-        column_names = {c.get("column_name", "").lower() for c in columns}
+        column_names = {
+            c.get("column_name", "").lower() for c in (columns or [])
+        }
         date_columns = ["created_at", "updated_at", "date", "timestamp", "inserted_at"]
+
+        db_type = self._get_db_type(state)
+        full_table = (
+            f"{self._quote_ident(schema_part, db_type)}."
+            f"{self._quote_ident(table_part, db_type)}"
+            if schema_part
+            else self._quote_ident(table_part, db_type)
+        )
+
         for col in date_columns:
             if col not in column_names:
                 continue
             # Валидация имени колонки (оно берётся из БД, но перестрахуемся)
             if not re.fullmatch(r"[a-zA-Z0-9_]+", col):
                 continue
-            sql = f"SELECT MAX({col}) AS last_date FROM {table_name}"
+            # MySQL падает на зарезервированных словах (date, timestamp),
+            # поэтому колонка и таблица всегда квотируются по диалекту.
+            sql = (
+                f"SELECT MAX({self._quote_ident(col, db_type)}) AS last_date "
+                f"FROM {full_table}"
+            )
             try:
                 rows = await self.db_manager.execute_query(state.current_db, sql)
                 if rows and rows[0].get("last_date") is not None:
@@ -999,7 +1092,10 @@ class RepdixEngine:
         state = self.sessions.get(user_id)
         lock = state.lock
 
-        default_schema = self._get_default_schema(state)
+        # default_schema вычисляется ПОСЛЕ загрузки кэша (см. ниже): до
+        # восстановления current_db из session:{user_id} схема по умолчанию
+        # всегда получалась "public", даже для MySQL.
+        default_schema = ""
 
         if lock.locked():
             return ChatResponse(text="⏳ Пожалуйста, дождитесь ответа на предыдущий вопрос. Я ещё обрабатываю его.")
@@ -1057,6 +1153,40 @@ class RepdixEngine:
                     if isinstance(loaded_facts, list):
                         state.long_term_facts = [str(f) for f in loaded_facts]
 
+                # Выбранная БД/модель, резюме и последние SQL: отдельный ключ
+                # session:{user_id} (формат — JSON-объект). Битый/отсутствующий
+                # ключ НЕ сбрасывает значения, уже установленные в этой сессии.
+                session_raw = await self.cache_manager.get(f"session:{user_id}")
+                if session_raw:
+                    try:
+                        session_payload = json.loads(session_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        session_payload = None
+                    if isinstance(session_payload, dict):
+                        restored_db = session_payload.get("current_db")
+                        if isinstance(restored_db, str) and restored_db:
+                            # Не восстанавливаем БД, которой больше нет в конфиге.
+                            known_dbs = (
+                                self.db_manager.get_db_names()
+                                if self.db_manager is not None else [restored_db]
+                            )
+                            if restored_db in known_dbs:
+                                state.current_db = restored_db
+                        restored_model = session_payload.get("current_model")
+                        if isinstance(restored_model, str) and restored_model:
+                            state.current_model = restored_model
+                        restored_summary = session_payload.get("summary")
+                        if isinstance(restored_summary, str) and restored_summary:
+                            state.summary = restored_summary
+                        restored_sqls = session_payload.get("last_sqls")
+                        if isinstance(restored_sqls, list):
+                            state.last_sqls = [
+                                s for s in restored_sqls if isinstance(s, str)
+                            ]
+
+            # Пересчитываем схему по умолчанию уже с восстановленным current_db.
+            default_schema = self._get_default_schema(state)
+
             # ---------- /clear ----------
             if text == "/clear":
                 state.last_model_used = "algorithm (command)"
@@ -1064,6 +1194,7 @@ class RepdixEngine:
                 state.summary = ""
                 if self.cache_manager is not None:
                     await self.cache_manager.delete(f"repdix:history:{user_id}")
+                await self._persist_session(state, user_id)
                 audit_answer = "История очищена. Долгосрочная память сохранена."
                 if self.show_model_in_response:
                     audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -1133,7 +1264,10 @@ class RepdixEngine:
                          "content": "Сожми следующий диалог в краткое резюме (не более 3-4 предложений). Сохрани ключевые факты, вопросы и ответы."},
                         {"role": "user", "content": json.dumps(state.history, ensure_ascii=False)}
                     ]
-                    response = await self.llm_client.chat(messages, model_name=state.current_model)
+                    response = await self.llm_client.chat(
+                        messages,
+                        model_name=state.current_model or self.tool_model,
+                    )
                     summary = response["choices"][0]["message"]["content"]
                     state.summary = summary
                     state.history = [{"role": "system", "content": f"Резюме предыдущего диалога: {summary}"}]
@@ -1146,6 +1280,7 @@ class RepdixEngine:
                             ),
                             ttl=86400,
                         )
+                    await self._persist_session(state, user_id)
                     audit_answer = f"История сжата. Новый размер: {len(state.history)} сообщений. Резюме: {summary[:300]}..."
                     if self.show_model_in_response:
                         audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -1295,6 +1430,7 @@ class RepdixEngine:
                 if self.cache_manager is not None:
                     await self.cache_manager.delete(f"repdix:history:{user_id}")
                     await self.cache_manager.delete(f"repdix:memory:{user_id}")
+                await self._persist_session(state, user_id)
                 audit_answer = (
                     "🔄 Всё сброшено: история и долгосрочная память очищены."
                 )
@@ -1315,6 +1451,7 @@ class RepdixEngine:
                     audit_answer = "\n".join(lines)
                 else:
                     state.current_db = db_name
+                    await self._persist_session(state, user_id)
                     default_schema = self._get_default_schema(state)
                     display = self.db_manager.get_db_display_name(state.current_db)
                     audit_answer = (
@@ -1360,6 +1497,7 @@ class RepdixEngine:
                 resolved = self.llm_client.resolve_model_name(model_name) if self.llm_client else None
                 if resolved:
                     state.current_model = resolved
+                    await self._persist_session(state, user_id)
                     audit_answer = f"Модель: {state.current_model}"
                 else:
                     available_models = self.llm_client.get_model_names() if self.llm_client else []
@@ -1420,17 +1558,41 @@ class RepdixEngine:
                     )
                     rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
                     technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
-                    if not rbac_ok and ("admin" in user_roles) and not technical_denied:
-                        logger.info("/sql: admin bypass for non-technical SQL")
-                    elif not rbac_ok:
-                        log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
-                        audit_answer = f"⛔ Доступ запрещен: {rbac_msg}"
-                        if self.show_model_in_response:
-                            audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
-                        self._log_audit(state, msg, audit_question, audit_answer)
-                        return ChatResponse(text=audit_answer)
+
+                    # SELECT * по таблице с ограниченным набором полей:
+                    # пробуем развернуть звёздочку в явный список разрешённых
+                    # полей (RBAC при этом не ослабляется — результат
+                    # повторно валидируется).
+                    if (
+                        not rbac_ok
+                        and not technical_denied
+                        and self.rbac.is_select_star_denial(rbac_msg)
+                    ):
+                        expanded_sql = await self._try_expand_select_star(
+                            sql, state, user_roles, default_schema,
+                            source="manual",
+                        )
+                        if expanded_sql:
+                            sql = expanded_sql
+                            rbac_ok, rbac_msg = True, sql
+
+                    if not rbac_ok:
+                        if "admin" in user_roles and not technical_denied:
+                            logger.info("/sql: admin bypass for non-technical SQL")
+                            rbac_ok = True
+                            # sql оставляем как есть — это осознанный обход для админа
+                        else:
+                            log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
+                            audit_answer = f"⛔ Доступ запрещен: {rbac_msg}"
+                            if self.show_model_in_response:
+                                audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                            self._log_audit(state, msg, audit_question, audit_answer)
+                            return ChatResponse(text=audit_answer)
                     else:
-                        sql = rbac_msg
+                        # rbac_ok=True. Если это была НЕ админ-ветка и validate_sql
+                        # вернул нормализованный sql — подставляем его.
+                        if rbac_msg and rbac_msg != sql:
+                            sql = rbac_msg
 
                 if state.current_db is None:
                     audit_answer = "Сначала выберите БД командой /db <name>"
@@ -1439,19 +1601,25 @@ class RepdixEngine:
                     self._log_audit(state, msg, audit_question, audit_answer)
                     return ChatResponse(text=audit_answer)
 
+                # В БД — без комментариев (чистое имя колонки в ответе:
+                # cursor.description иначе вернёт "1 -- ; DROP TABLE x").
+                # В аудит и last_sqls — оригинал (for forensics).
+                sql_for_exec = strip_sql_comments(sql)
+                audit_sql = sql
+
                 start_time = time.perf_counter()
                 try:
-                    rows = await self.db_manager.execute_query(state.current_db, sql)
+                    rows = await self.db_manager.execute_query(state.current_db, sql_for_exec)
                     duration = time.perf_counter() - start_time
                     if rows is None:
                         rows = []
-                    extracted = self._extract_table_from_sql(sql)
+                    extracted = self._extract_table_from_sql(audit_sql)
                     schema_part, table_part = extracted if extracted else (None, None)
                     audit_answer = await self._format_sql_result(
                         rows, db_name=state.current_db,
                         schema=schema_part, table_name=table_part,
                     )
-                    self._log_sql_audit(sql, duration, "success", source="manual")
+                    self._log_sql_audit(audit_sql, duration, "success", source="manual")
                     if self.show_model_in_response:
                         audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                     self._log_audit(state, msg, audit_question, audit_answer)
@@ -1459,7 +1627,7 @@ class RepdixEngine:
                 except Exception as e:
                     duration = time.perf_counter() - start_time
                     err_str = str(e)
-                    self._log_sql_audit(sql, duration, "error", err_str, source="manual")
+                    self._log_sql_audit(audit_sql, duration, "error", err_str, source="manual")
                     if "timeout" in err_str.lower() or "MAX_EXECUTION_TIME" in err_str:
                         timeout_val = os.environ.get('SQL_QUERY_TIMEOUT', '15')
                         audit_answer = f"Запрос выполнялся слишком долго (лимит {timeout_val} сек) и был прерван."
@@ -1483,6 +1651,12 @@ class RepdixEngine:
                 if has_time_context and not has_structure_context:
                     last_date = await self._try_get_last_date(state, text)
                     if last_date:
+                        audit_logger.info(json.dumps({
+                            "timestamp": datetime.now().isoformat(),
+                            "type": "deterministic_last_date",
+                            "table": text,
+                            "result": str(last_date),
+                        }, ensure_ascii=False))
                         audit_answer = f"Последняя запись в таблице {text}: {last_date}"
                         if self.show_model_in_response:
                             audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -1498,6 +1672,11 @@ class RepdixEngine:
                         self._log_audit(state, msg, audit_question, audit_answer)
                         return ChatResponse(text=audit_answer)
 
+                    audit_logger.info(json.dumps({
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "deterministic_table_schema",
+                        "table": text,
+                    }, ensure_ascii=False))
                     audit_answer = await self._format_sql_result(rows)
                     if self.show_model_in_response:
                         audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -1626,7 +1805,7 @@ class RepdixEngine:
                 messages.append({"role": "user", "content": msg.text})
 
                 # ---------- ЦИКЛ АГЕНТА (до 5 шагов) ----------
-                max_steps = 5
+                max_steps = self.agent_max_steps
                 step = 0
                 final_text = ""
 
@@ -1644,10 +1823,10 @@ class RepdixEngine:
 
                     # Статус — только если модель реально вызывает инструмент
                     if tool_calls and msg.status_callback:
-                        # ВАЖНО: НЕ обрезаем текст (_shorten_text) — обрезка
-                        # могла разорвать HTML-тег (<b>...</b>) и Telegram
-                        # отвечал "Can't parse entities". Разметку отдаём как
-                        # есть, лишь схлопываем пробелы в одну строку.
+                        # ВАЖНО: НЕ обрезаем текст — обрезка могла разорвать
+                        # HTML-тег (<b>...</b>) и Telegram отвечал
+                        # "Can't parse entities". Разметку отдаём как есть,
+                        # лишь схлопываем пробелы в одну строку и снимаем теги.
                         clean_text = re.sub(
                             r"\s+", " ", choice.get("content") or "",
                         ).strip()
@@ -1691,18 +1870,88 @@ class RepdixEngine:
                                     "content": "Ошибка: некорректные аргументы инструмента",
                                 })
                                 continue
+
+                            table_name = str(table_name or "").strip()
+                            if not table_name:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "content": "Ошибка: не указано имя таблицы",
+                                })
+                                continue
+
+                            # Технические таблицы не раскрываем даже на уровне
+                            # метаданных (как в _get_relations_text).
+                            if is_technical_qualified(table_name):
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tool_call["id"],
+                                    "content": "Связи для этой таблицы недоступны.",
+                                })
+                                continue
+
+                            # RBAC: таблица должна быть разрешена пользователю.
+                            # Проверяем через validate_sql на простом SELECT —
+                            # отдельного метода для метаданных связей нет.
+                            # Если user_manager не подключён — проверка
+                            # пропускается (как в остальных ветках).
+                            if self.user_manager:
+                                user_roles = (
+                                    self.user_manager.get_user_roles(user_id) or []
+                                )
+                                rbac_ok, rbac_msg = self.rbac.validate_sql(
+                                    f"SELECT 1 FROM {table_name}",
+                                    user_roles,
+                                    default_schema,
+                                )
+                                if not rbac_ok:
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call["id"],
+                                        "content": (
+                                            f"⛔ Доступ запрещен: {rbac_msg}. "
+                                            "Сообщи пользователю причину отказа и "
+                                            "НЕ придумывай результат."
+                                        ),
+                                    })
+                                    continue
+
                             try:
                                 with open("config/relations.yaml", "r", encoding="utf-8") as f:
                                     relations_data = (yaml.safe_load(f) or {}).get("relations", {})
                             except (FileNotFoundError, yaml.YAMLError):
                                 relations_data = {}
+
                             table_relations = relations_data.get(table_name, [])
-                            if not table_relations:
+
+                            # Технический фильтр связей: колонки и таблицы-цели
+                            # (ref_table из references) скрываем так же, как
+                            # в _get_relations_text. RBAC для ref_table не
+                            # применяем — это метаданные, а не доступ к данным.
+                            filtered_relations = []
+                            for rel in table_relations:
+                                col = str(rel.get("column", ""))
+                                ref = str(rel.get("references", ""))
+
+                                if is_technical_qualified(col):
+                                    continue
+                                if "." in ref:
+                                    ref_table = ".".join(
+                                        ref.split(".")[:-1]
+                                    ).lower()
+                                    if is_technical_qualified(ref_table):
+                                        continue
+                                filtered_relations.append(rel)
+
+                            if not filtered_relations:
                                 result_text = f"Связи для таблицы {table_name} не описаны."
                             else:
                                 lines = [f"Связи для {table_name}:"]
-                                for rel in table_relations:
-                                    lines.append(f"- {rel['column']} -> {rel['references']} ({rel.get('description', '')})")
+                                for rel in filtered_relations:
+                                    lines.append(
+                                        f"- {rel['column']} -> {rel['references']} "
+                                        f"({rel.get('description', '')})"
+                                    )
                                 result_text = "\n".join(lines)
                             messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result_text})
                             continue
@@ -1739,21 +1988,43 @@ class RepdixEngine:
                             )
                             rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
                             technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
-                            if not rbac_ok and ("admin" in user_roles) and not technical_denied:
-                                logger.info("tool_call: admin bypass for non-technical SQL")
-                            elif not rbac_ok:
-                                log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call["id"],
-                                    "content": (
-                                        f"⛔ Доступ запрещен: {rbac_msg}. "
-                                        "Сообщи пользователю причину отказа и НЕ придумывай результат."
-                                    ),
-                                })
-                                continue
+
+                            # Мягкий выход из отказа по SELECT *: разворачиваем
+                            # звёздочку в разрешённые поля и валидируем снова.
+                            if (
+                                not rbac_ok
+                                and not technical_denied
+                                and self.rbac.is_select_star_denial(rbac_msg)
+                            ):
+                                expanded_sql = await self._try_expand_select_star(
+                                    sql, state, user_roles, default_schema,
+                                    source="llm",
+                                )
+                                if expanded_sql:
+                                    sql = expanded_sql
+                                    rbac_ok, rbac_msg = True, sql
+
+                            if not rbac_ok:
+                                if "admin" in user_roles and not technical_denied:
+                                    logger.info("tool_call: admin bypass for non-technical SQL")
+                                    rbac_ok = True
+                                    # sql оставляем как есть — это осознанный обход для админа
+                                else:
+                                    log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
+                                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call["id"],
+                                        "content": (
+                                            f"⛔ Доступ запрещен: {rbac_msg}. "
+                                            "Сообщи пользователю причину отказа и НЕ придумывай результат."
+                                        ),
+                                    })
+                                    continue
                             else:
-                                sql = rbac_msg
+                                # rbac_ok=True. Если это была НЕ админ-ветка и validate_sql
+                                # вернул нормализованный sql — подставляем его.
+                                if rbac_msg and rbac_msg != sql:
+                                    sql = rbac_msg
 
                         if state.current_db is None:
                             messages.append({
@@ -1780,13 +2051,18 @@ class RepdixEngine:
                             else:
                                 sql = sql.rstrip() + f" LIMIT {self.max_rows_in_response}"
 
+                        # auto-LIMIT добавлен выше; теперь отделяем SQL для
+                        # выполнения (без комментариев) от аудита (оригинал).
+                        sql_for_exec = strip_sql_comments(sql)
+                        audit_sql = sql
+
                         start_time = time.perf_counter()
                         try:
-                            rows = await self.db_manager.execute_query(state.current_db, sql)
+                            rows = await self.db_manager.execute_query(state.current_db, sql_for_exec)
                             duration = time.perf_counter() - start_time
                             if rows is None:
                                 rows = []
-                            extracted = self._extract_table_from_sql(sql)
+                            extracted = self._extract_table_from_sql(audit_sql)
                             schema_part, table_part = (
                                 extracted if extracted else (None, None)
                             )
@@ -1799,16 +2075,16 @@ class RepdixEngine:
                                 "tool_call_id": tool_call["id"],
                                 "content": result_text,
                             })
-                            self._log_sql_audit(sql, duration, "success", source="llm")
-                            logger.info("Executed SQL: %s", sql)
+                            self._log_sql_audit(audit_sql, duration, "success", source="llm")
+                            logger.info("Executed SQL: %s", audit_sql)
                             # Запоминаем реальный SQL отдельно (для будущих уточнений)
-                            state.last_sqls.append(sql)
+                            state.last_sqls.append(audit_sql)
                             if len(state.last_sqls) > 20:
                                 state.last_sqls = state.last_sqls[-20:]
                         except Exception as e:
                             duration = time.perf_counter() - start_time
                             err_str = str(e)
-                            self._log_sql_audit(sql, duration, "error", err_str, source="llm")
+                            self._log_sql_audit(audit_sql, duration, "error", err_str, source="llm")
                             if "timeout" in err_str.lower() or "MAX_EXECUTION_TIME" in err_str:
                                 timeout_val = os.environ.get('SQL_QUERY_TIMEOUT', '15')
                                 error_msg = f"Запрос выполнялся слишком долго (лимит {timeout_val} сек) и был прерван."
@@ -1821,6 +2097,15 @@ class RepdixEngine:
                             })
 
                 # После цикла
+                if not final_text and step == max_steps:
+                    logger.warning(
+                        "Agent loop reached max_steps",
+                        extra={
+                            "steps": step,
+                            "max_steps": max_steps,
+                            "user_id": user_id,
+                        },
+                    )
                 if not final_text:
                     messages.append({
                         "role": "system",
@@ -2075,6 +2360,32 @@ class RepdixEngine:
         except Exception as e:
             logger.warning("Не удалось сохранить память %s: %s", user_id, e)
 
+    # ---------- Персистенция сессии (session:{user_id}) ----------
+    async def _persist_session(self, state: SessionState, user_id: str) -> None:
+        """Зеркалит current_db/current_model/summary/last_sqls в Redis.
+
+        Ключ session:{user_id} (TTL 24 часа) дополняет repdix:history и
+        repdix:memory: история и память живут отдельно, а выбранная БД,
+        модель и последние SQL иначе теряются при рестарте процесса.
+        При отсутствии/сбое Redis просто логируем (graceful degradation).
+        """
+        if self.cache_manager is None:
+            return
+        payload = {
+            "current_db": state.current_db,
+            "current_model": state.current_model,
+            "summary": state.summary,
+            "last_sqls": [str(s) for s in state.last_sqls],
+        }
+        try:
+            await self.cache_manager.set(
+                f"session:{user_id}",
+                json.dumps(payload, ensure_ascii=False),
+                ttl=86400,
+            )
+        except Exception as e:
+            logger.warning("Не удалось сохранить сессию %s: %s", user_id, e)
+
     # ---------- Сохранение истории ----------
     async def _save_history(self, state: SessionState, user_id: str,
                              user_text: str, assistant_text: str) -> None:
@@ -2105,6 +2416,131 @@ class RepdixEngine:
                 ttl=86400,
             )
 
+    # ---------- SELECT *: авторазвёртывание ----------
+    async def _expand_select_star_sql(
+        self,
+        sql: str,
+        state: SessionState,
+        user_roles: list[str],
+        default_schema: str,
+    ) -> str | None:
+        """Пробует развернуть SELECT * в явный список разрешённых полей.
+
+        Колонки подгружаются заранее (async), затем синхронный
+        rbac.expand_select_star получает их через коллбэк-словарь.
+
+        Returns:
+            Новый SQL (ещё не проверенный RBAC) или None, если развернуть
+            не удалось.
+        """
+        current_db = getattr(state, "current_db", None)
+        if self.db_manager is None or current_db is None:
+            return None
+
+        try:
+            tables = self.rbac.extract_tables(sql, default_schema)
+        except Exception as e:
+            logger.debug("expand_select_star: не удалось разобрать SQL: %s", e)
+            return None
+        if not tables:
+            return None
+
+        columns_cache: dict[str, list[str]] = {}
+        for qualified in tables:
+            schema_part, table_part = self._split_qualified(
+                qualified, default_schema,
+            )
+            try:
+                columns = await self.db_manager.get_table_schema(
+                    current_db, table_part, schema_part or None,
+                )
+            except Exception as e:
+                logger.debug(
+                    "expand_select_star: не удалось получить поля %s: %s",
+                    qualified, e,
+                )
+                continue
+            names = [
+                str(c.get("column_name", ""))
+                for c in (columns or [])
+                if c.get("column_name")
+            ]
+            if names:
+                columns_cache[qualified.lower()] = names
+                columns_cache.setdefault(table_part.lower(), names)
+
+        def _getter(name: str) -> list[str] | None:
+            key = str(name or "").lower()
+            if not key:
+                return None
+            return columns_cache.get(key) or columns_cache.get(
+                key.split(".")[-1]
+            )
+
+        try:
+            expanded = self.rbac.expand_select_star(
+                sql, user_roles, default_schema, all_columns_getter=_getter,
+            )
+        except Exception as e:
+            logger.warning("expand_select_star: ошибка развёртывания: %s", e)
+            return None
+
+        if not expanded or expanded.strip() == (sql or "").strip():
+            return None
+        return expanded
+
+    async def _try_expand_select_star(
+        self,
+        sql: str,
+        state: SessionState,
+        user_roles: list[str],
+        default_schema: str,
+        source: str,
+    ) -> str | None:
+        """Разворачивает SELECT * и повторно валидирует результат.
+
+        Args:
+            source: "llm" (tool_call) или "manual" (/sql) — для audit.log.
+
+        Returns:
+            Валидный SQL или None, если «починить» запрос не удалось.
+        """
+        # state может быть заглушкой без user_id (например, в тестах) —
+        # доступ к атрибуту через getattr, чтобы не падать с AttributeError.
+        user_id_for_log = getattr(state, "user_id", None) or "unknown"
+
+        expanded = await self._expand_select_star_sql(
+            sql, state, user_roles, default_schema,
+        )
+        if not expanded:
+            # Неудача развёртывания — отдельное событие безопасности:
+            # попытка обойти ограничение на SELECT * должна оставлять след.
+            # Длину/SQL-санитайзинг выполняет сам log_violation.
+            log_violation(
+                user_id_for_log,
+                sql,
+                "expand_select_star failed",
+            )
+            return None
+
+        ok, message = self.rbac.validate_sql(
+            expanded, user_roles, default_schema,
+        )
+        if not ok:
+            logger.info(
+                "expand_select_star: развёрнутый запрос не прошёл RBAC: %s",
+                message,
+            )
+            log_violation(
+                user_id_for_log,
+                expanded,
+                f"expand_select_star rejected: {message}",
+            )
+            return None
+
+        self._log_star_expansion(sql, expanded, source=source)
+        return expanded
+
     # ---------- Аудит ----------
     def _log_audit(self, state: SessionState, msg: ChatMessage,
                     question: str, answer: str) -> None:
@@ -2133,3 +2569,14 @@ class RepdixEngine:
         if error:
             data["error"] = error
         audit_logger.info(json.dumps(data, ensure_ascii=False))
+
+    def _log_star_expansion(self, original_sql: str, expanded_sql: str,
+                            source: str = "llm") -> None:
+        """Пишет в audit.log факт авторазвёртывания SELECT *."""
+        audit_logger.info(json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "type": "select_star_expanded",
+            "source": source,
+            "original_sql": original_sql,
+            "expanded_sql": expanded_sql,
+        }, ensure_ascii=False))

@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261030.02'
+dv_file_version = '261030.03'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -19,6 +19,11 @@ dv_file_version = '261030.02'
    блокируются в любом месте AST (включая подзапросы и UNION) — до
    применения RBAC-правил. Wildcard "*" (admin) их не открывает.
 7. Парсинг fail-closed: любая ошибка sqlglot — отказ.
+8. Отказ по SELECT * объясняет, какие поля разрешены («нельзя SELECT *.
+   Разрешённые поля: ...»). expand_select_star() может автоматически
+   заменить * на этот список — безопасность при этом не ослабляется,
+   подставляются только поля из allowed_columns (либо все поля таблицы
+   минус excluded_columns), технические поля отбрасываются всегда.
 """
 
 import logging
@@ -39,6 +44,11 @@ SYSTEM_TABLES = (
     "pg_catalog",
     "sqlite_master",
 )
+
+
+# Маркер отказа по SELECT *. По нему engine понимает, что запрос можно
+# попробовать «починить» автоподстановкой разрешённых полей.
+SELECT_STAR_ERROR_MARKER = "нельзя SELECT *"
 
 
 class RBACGuard:
@@ -378,6 +388,9 @@ class RBACGuard:
         # Карта: qualified-имя таблицы (schema.table) -> правило
         # Нужна, чтобы при проверке колонок знать, к какой таблице они относятся.
         table_rule_map: dict[str, dict] = {}
+        # Карта: ключ table_rule_map -> qualified-имя (для текстов отказов
+        # и для развёртывания звёздочек).
+        qualified_by_key: dict[str, str] = {}
 
         for table in parsed.find_all(exp.Table):
             tbl_name = (table.name or "").lower()
@@ -403,10 +416,12 @@ class RBACGuard:
                 return False, f"Доступ к таблице '{qualified}' запрещен."
 
             table_rule_map[qualified] = matched
+            qualified_by_key[qualified] = qualified
             # Также кладём короткое имя — для случая, когда колонки в SQL
             # не квалифицированы (SELECT col FROM t) и sqlglot не привязывает
             # их к таблице.
             table_rule_map.setdefault(tbl_name, matched)
+            qualified_by_key.setdefault(tbl_name, qualified)
 
         if not table_rule_map:
             return False, "В запросе не найдено ни одной таблицы."
@@ -422,21 +437,26 @@ class RBACGuard:
             # sqlglot: t.* — это Column(this=Star, table=Identifier).
             parent = star.parent
             target_rule = None
+            target_name = ""
 
             if isinstance(parent, exp.Column) and parent.table:
                 raw_tbl = parent.table
                 qual_tbl = (raw_tbl.name if hasattr(raw_tbl, "name") else str(raw_tbl)).lower()
                 target_rule = table_rule_map.get(qual_tbl)
+                if target_rule is not None:
+                    target_name = qualified_by_key.get(qual_tbl, qual_tbl)
 
             if target_rule is None:
-                # SELECT * — проверим все таблицы запроса
-                for r in table_rule_map.values():
-                    reason = self._star_forbidden_reason(r)
+                # SELECT * / COUNT(*) — проверим все таблицы запроса
+                for key, r in table_rule_map.items():
+                    reason = self._star_forbidden_reason(
+                        r, qualified_by_key.get(key, key),
+                    )
                     if reason:
                         return False, reason
                 continue
 
-            reason = self._star_forbidden_reason(target_rule)
+            reason = self._star_forbidden_reason(target_rule, target_name)
             if reason:
                 return False, reason
 
@@ -534,22 +554,38 @@ class RBACGuard:
     # Проверка SELECT * по правилу таблицы
     # ------------------------------------------------------------------
     @staticmethod
-    def _star_forbidden_reason(rule: dict) -> str | None:
+    def _star_forbidden_reason(rule: dict, qualified: str = "") -> str | None:
         """Возвращает причину запрета SELECT * для правила таблицы или None.
+
+        Сообщение перечисляет разрешённые поля: по нему LLM может переписать
+        запрос, а engine — автоматически развернуть звёздочку
+        (expand_select_star) и выполнить запрос.
 
         Звёздочка разрешена ТОЛЬКО если allowed_columns == "*" (has_wildcard)
         и нет excluded_columns. Явный белый список (allowed_columns: [a, b])
         требует перечисления полей — иначе SELECT * вернул бы поля вне списка.
         """
-        if rule.get("excluded"):
+        table_label = qualified or "таблицы"
+        allowed = rule.get("allowed") or set()
+        excluded = rule.get("excluded") or set()
+
+        if excluded:
+            if allowed:
+                allowed_part = ", ".join(sorted(allowed))
+            else:
+                # Полный список полей известен только БД, поэтому описываем
+                # правило через исключения — engine развернёт его по факту.
+                allowed_part = "все, кроме: " + ", ".join(sorted(excluded))
             return (
-                "SELECT * запрещён: у таблицы есть скрытые поля. "
-                "Перечислите разрешённые поля явно."
+                f"Для таблицы '{table_label}' нельзя SELECT *: есть скрытые поля. "
+                f"Разрешённые поля: {allowed_part}. Перепиши запрос."
             )
-        if rule.get("allowed") and not rule.get("has_wildcard"):
+
+        if allowed and not rule.get("has_wildcard"):
             return (
-                "SELECT * запрещён: таблица имеет явный белый список полей "
-                "(allowed_columns). Перечислите разрешённые поля явно."
+                f"Для таблицы '{table_label}' нельзя SELECT *. "
+                f"Разрешённые поля: {', '.join(sorted(allowed))}. "
+                "Перепиши запрос."
             )
         return None
 
@@ -594,3 +630,232 @@ class RBACGuard:
             return rules[tbl_name]
 
         return None
+
+    # ------------------------------------------------------------------
+    # Авторазвёртывание SELECT * (мягкий выход из отказа, без ослабления RBAC)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_select_star_denial(reason: str) -> bool:
+        """True, если отказ вызван SELECT * и запрос можно попробовать починить."""
+        return SELECT_STAR_ERROR_MARKER in (reason or "")
+
+    def extract_tables(self, sql: str, default_schema: str = "") -> list[str]:
+        """Возвращает таблицы запроса как schema.table (lowercase).
+
+        Нужен engine: expand_select_star синхронный, а полный список колонок
+        из БД берётся асинхронно — значит, таблицы должны быть известны
+        заранее. При ошибке парсинга возвращает [].
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, read="mysql")
+        except Exception:
+            return []
+        if parsed is None:
+            return []
+
+        default_schema_l = (default_schema or "").strip().lower()
+        result: list[str] = []
+        seen: set[str] = set()
+        for table in parsed.find_all(exp.Table):
+            name = self._table_qualified_name(table)
+            if not name:
+                continue
+            if "." not in name and default_schema_l:
+                name = f"{default_schema_l}.{name}"
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+        return result
+
+    @staticmethod
+    def _direct_tables(select: exp.Select) -> list[exp.Table]:
+        """Таблицы из FROM/JOIN конкретного SELECT (без подзапросов)."""
+        result: list[exp.Table] = []
+        from_clause = select.args.get("from") or select.args.get("from_")
+        if from_clause is not None and isinstance(from_clause.this, exp.Table):
+            result.append(from_clause.this)
+        for join in select.args.get("joins") or []:
+            if isinstance(join.this, exp.Table):
+                result.append(join.this)
+        return result
+
+    @classmethod
+    def _find_table_by_qualifier(cls, select: exp.Select,
+                                 qualifier: str) -> exp.Table | None:
+        """Ищет таблицу по алиасу / короткому / полному имени."""
+        q = (qualifier or "").lower()
+        if not q:
+            return None
+        for table in cls._direct_tables(select):
+            names = {
+                (table.alias_or_name or "").lower(),
+                (table.name or "").lower(),
+                cls._table_qualified_name(table),
+            }
+            if q in names:
+                return table
+        return None
+
+    def expand_select_star(
+        self,
+        sql: str,
+        user_roles: list[str],
+        default_schema: str = "",
+        all_columns_getter=None,
+    ) -> str:
+        """Заменяет SELECT * на явный список разрешённых полей.
+
+        Подставляются только поля из allowed_columns либо (если задан лишь
+        excluded_columns) все поля таблицы минус исключённые. Технические
+        поля отбрасываются. Безопасность не ослабляется: результат всё равно
+        нужно прогнать через validate_sql.
+
+        Args:
+            sql: Исходный SQL.
+            user_roles: Роли пользователя.
+            default_schema: Схема для коротких имён.
+            all_columns_getter: Синхронный коллбэк
+                (qualified | short name) -> list[str] | None. Нужен только
+                для таблиц с excluded_columns (чтобы вычислить «все, кроме»).
+
+        Returns:
+            SQL с развёрнутыми звёздочками либо исходный SQL, если развернуть
+            не удалось (ошибка парсинга, неизвестная таблица, SELECT * из
+            нескольких таблиц без квалификатора, подзапрос и т.п.).
+        """
+        if not sql:
+            return sql
+
+        try:
+            parsed = sqlglot.parse_one(sql, read="mysql")
+        except Exception:
+            return sql
+        if parsed is None:
+            return sql
+
+        self._load_config()
+        rules = self._collect_rules(user_roles)
+        if not rules:
+            return sql
+
+        default_schema_l = (default_schema or "").strip().lower()
+
+        def _resolve_columns(rule: dict, qualified: str) -> list[str] | None:
+            """Список полей для подстановки или None, если развернуть нельзя."""
+            allowed = rule.get("allowed") or set()
+            excluded = rule.get("excluded") or set()
+
+            if allowed and not rule.get("has_wildcard"):
+                columns = sorted(allowed)
+            elif excluded:
+                if all_columns_getter is None:
+                    return None
+                all_columns = all_columns_getter(qualified)
+                if not all_columns and "." in qualified:
+                    all_columns = all_columns_getter(qualified.split(".")[-1])
+                if not all_columns:
+                    return None
+                columns = [
+                    str(c) for c in all_columns
+                    if str(c).lower() not in excluded
+                ]
+            else:
+                # Звёздочка разрешена целиком — разворачивать нечего.
+                return None
+
+            cleaned = [
+                c for c in columns
+                if c and not is_technical_qualified(str(c).lower())
+            ]
+            return cleaned or None
+
+        expanded_any = False
+        unresolved = False
+
+        for select in list(parsed.find_all(exp.Select)):
+            projections = list(select.expressions)
+            if not projections:
+                continue
+
+            new_projections: list[exp.Expression] = []
+            changed = False
+
+            for projection in projections:
+                target_table: exp.Table | None = None
+
+                if isinstance(projection, exp.Star):
+                    direct = self._direct_tables(select)
+                    if len(direct) != 1:
+                        # Несколько таблиц: непонятно, чьи поля подставлять.
+                        new_projections.append(projection)
+                        unresolved = True
+                        continue
+                    target_table = direct[0]
+                elif (
+                    isinstance(projection, exp.Column)
+                    and isinstance(projection.this, exp.Star)
+                ):
+                    raw_tbl = projection.table
+                    qualifier = (
+                        raw_tbl.name
+                        if hasattr(raw_tbl, "name")
+                        else str(raw_tbl)
+                    )
+                    target_table = self._find_table_by_qualifier(select, qualifier)
+                    if target_table is None:
+                        new_projections.append(projection)
+                        unresolved = True
+                        continue
+                else:
+                    new_projections.append(projection)
+                    continue
+
+                qualified = self._table_qualified_name(target_table)
+                if "." in qualified:
+                    schema_name, tbl_name = qualified.split(".", 1)
+                else:
+                    schema_name, tbl_name = default_schema_l, qualified
+
+                rule = self._match_table_rule(tbl_name, schema_name, rules)
+                if rule is None:
+                    new_projections.append(projection)
+                    unresolved = True
+                    continue
+
+                full_name = (
+                    f"{schema_name}.{tbl_name}" if schema_name else tbl_name
+                )
+                columns = _resolve_columns(rule, full_name)
+                if not columns:
+                    new_projections.append(projection)
+                    unresolved = True
+                    continue
+
+                alias = target_table.alias_or_name or tbl_name
+                table_identifier = (
+                    exp.to_identifier(alias, quoted=True) if alias else None
+                )
+                for column in columns:
+                    new_projections.append(
+                        exp.Column(
+                            this=exp.to_identifier(column, quoted=True),
+                            table=(
+                                table_identifier.copy()
+                                if table_identifier is not None
+                                else None
+                            ),
+                        )
+                    )
+                changed = True
+
+            if changed:
+                expanded_any = True
+                select.set("expressions", new_projections)
+
+        if not expanded_any or unresolved:
+            return sql
+
+        try:
+            return parsed.sql(dialect="mysql")
+        except Exception:
+            return sql

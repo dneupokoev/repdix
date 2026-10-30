@@ -1,4 +1,5 @@
-dv_file_version = '261030.02'
+# tests/test_rbac_guard.py
+dv_file_version = '261030.03'
 """Тесты RBAC-гарда (app/core/rbac_guard.py).
 
 Проверяем, что технические таблицы/колонки блокируются ДО применения
@@ -192,8 +193,10 @@ def test_qualified_star_with_technical_columns(tmp_path):
 
     assert ok is False
     reason_lower = reason.lower()
-    assert "select *" in reason_lower and (
-        "forbidden" in reason_lower or "запрещён" in reason_lower
+    assert "select *" in reason_lower
+    assert any(
+        word in reason_lower
+        for word in ("forbidden", "запрещён", "запрещен", "нельзя")
     )
 
 
@@ -206,8 +209,10 @@ def test_qualified_star_with_excluded_columns(tmp_path):
 
     assert ok is False
     reason_lower = reason.lower()
-    assert "select *" in reason_lower and (
-        "forbidden" in reason_lower or "запрещён" in reason_lower
+    assert "select *" in reason_lower
+    assert any(
+        word in reason_lower
+        for word in ("forbidden", "запрещён", "запрещен", "нельзя")
     )
 
 
@@ -241,7 +246,11 @@ def test_select_star_blocked_when_allowed_columns_set_but_excluded_empty(tmp_pat
 
     assert ok is False
     reason_lower = reason.lower()
-    assert "select *" in reason_lower or "запрещён" in reason_lower
+    assert "select *" in reason_lower
+    assert any(
+        word in reason_lower
+        for word in ("forbidden", "запрещён", "запрещен", "нельзя")
+    )
 
 
 def test_qualified_select_star_blocked_when_allowed_columns_set(tmp_path):
@@ -255,7 +264,11 @@ def test_qualified_select_star_blocked_when_allowed_columns_set(tmp_path):
 
     assert ok is False
     reason_lower = reason.lower()
-    assert "select *" in reason_lower or "запрещён" in reason_lower
+    assert "select *" in reason_lower
+    assert any(
+        word in reason_lower
+        for word in ("forbidden", "запрещён", "запрещен", "нельзя")
+    )
 
 
 # ----------------------------------------------------------------------

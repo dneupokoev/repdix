@@ -2,7 +2,7 @@
 
 ## Назначение
 
-Модуль `app/core/db_manager.py` предоставляет асинхронный менеджер подключений к базам данных MySQL, PostgreSQL и SQLite. Он отвечает за:
+Модуль `app/core/db_manager.py` предоставляет асинхронный менеджер подключений к базам данных MySQL/MariaDB, PostgreSQL и SQLite. Он отвечает за:
 
 - загрузку конфигурации БД из YAML;
 - подстановку переменных окружения вида `${VAR}`;
@@ -15,24 +15,64 @@
 - скрытие технических сущностей через `technical_filter`;
 - безопасное закрытие соединений.
 
-Версия файла в коде: `261029.02`. В docstring перечислены ключевые изменения версии `261029.02` и `261027.06`. Ранее в документации указывались версии `261029.01` и `261028.01`; актуальной считать `261029.02`.
+Версия файла в коде: `261030.01`.
 
-Важное breaking change версии `261029.02`: `get_table_list()` и `get_table_schema()` принимают параметр `schema=` и работают с fully-qualified именами `schema.table`. Вызывающий код должен учитывать, что `get_table_list()` возвращает имена с префиксом схемы, а `get_table_schema()` ожидает отдельно `table_name` без схемы и `schema`.
+Ключевые изменения версии `261030.01`:
+
+- MySQL/MariaDB: при автогенерации `init_statements` серверный таймаут ставится всегда, независимо от `readonly`.
+- Для MariaDB используется `SET SESSION max_statement_time = <SQL_QUERY_TIMEOUT>` в секундах.
+- Для MySQL используется `SET SESSION MAX_EXECUTION_TIME = <мс>`.
+- `SET SESSION transaction_read_only = 1` по-прежнему ставится только при `readonly=true`.
+- Явно заданный непустой `init_statements` полностью переопределяет автогенерацию.
+
+Ключевые изменения версии `261029.04`:
+
+- MySQL: `init_command` может содержать несколько SET-запросов через `"; "`, пул создаётся с `client_flag=CLIENT.MULTI_STATEMENTS`.
+- MySQL: добавлен опциональный параметр конфига `init_statements` (список строк). Если он задан, используется вместо автогенерируемых SET.
+- MySQL/MariaDB: при `readonly=true` ставится `transaction_read_only` и серверный таймаут. Для MariaDB без `readonly` серверный таймаут ранее не ставился; в `261030.01` это исправлено.
+
+Ключевые изменения версии `261029.03`:
+
+- MySQL: `execute_query` обёрнут в `asyncio.wait_for(timeout=SQL_QUERY_TIMEOUT+2)`.
+- При срабатывании выбрасывается `TimeoutError` с тем же текстом, что и для SQLite.
+
+Ключевые изменения версии `261029.02`:
+
+- Поддержка нескольких схем в одной MySQL-БД: конфиг `schemas` (список или `"auto"`), `exclude_schemas`, `description`.
+- Добавлены `get_schemas()`, `get_db_description()`, `get_db_display_name()`.
+- `get_table_list()`/`get_table_schema()` принимают `schema=` и работают с fully-qualified именами `schema.table`. Это breaking change.
+- Добавлен in-memory кэш схемы/таблиц/колонок с TTL (`SCHEMA_CACHE_TTL_SEC`, по умолчанию `3600`), `invalidate_schema_cache()`, очистка кэша в `close()`.
+
+Ключевые изменения версии `261027.06`:
+
+- MySQL: `MAX_EXECUTION_TIME` ставится через `init_command` при создании пула.
+- PostgreSQL: добавлен `statement_timeout` в `server_settings`.
+- SQLite: при `readonly=true` выполняется `PRAGMA query_only = ON`.
+- Добавлен параметр `params` в `execute_query`.
+- `close()` безопасно обрабатывает `aiosqlite.Connection`, у которого нет `wait_closed()`.
+- `load_config()` не падает при отсутствии файла и проверяет тип `databases`.
+- Добавлены `get_db_type()` и `get_db_config()`.
+
+Важное breaking change версии `261029.02`: `get_table_list()` возвращает имена с префиксом схемы, а `get_table_schema()` ожидает отдельно `table_name` без схемы и `schema`.
 
 ## Зависимости и импорты
 
-Стандартная библиотека и внешние пакеты:
+Стандартная библиотека:
 
 - `asyncio`;
 - `logging`;
 - `os`;
 - `re`;
 - `time`;
-- `typing.Any`;
+- `typing.Any`.
+
+Внешние пакеты:
+
 - `yaml`;
 - `aiosqlite`;
 - `aiomysql`;
-- `asyncpg`.
+- `asyncpg`;
+- `pymysql.constants.CLIENT`.
 
 Внутренняя зависимость проекта:
 
@@ -111,7 +151,7 @@
 Логика:
 
 - `schemas: [..]` — явный список. Пустые и технические значения отфильтровываются через `is_technical()`;
-- `schemas: "auto"` — на текущий момент реально поддерживается только для MySQL: выполняется запрос к `information_schema.schemata`, исключаются схемы из `exclude_schemas` и технические схемы, результат сортируется;
+- `schemas: "auto"` — реально поддерживается только для MySQL: выполняется запрос к `information_schema.schemata`, исключаются схемы из `exclude_schemas` и технические схемы, результат сортируется;
 - если `exclude_schemas` не задан списком, по умолчанию исключаются `mysql`, `information_schema`, `performance_schema`, `sys`;
 - для PostgreSQL/SQLite значение `"auto"` приводит к fallback-логике;
 - если `schemas` не задан:
@@ -119,7 +159,7 @@
   - иначе возвращается `[conf["database"]]`, если значение непустое и не техническое;
   - иначе возвращается `[]`.
 
-При ошибке SQL в режиме `auto` логируется warning и возвращается fallback. Результат кэшируется.
+Успешный результат кэшируется. При ошибке SQL в режиме MySQL `auto` логируется warning и возвращается fallback без кэширования. Для не-`auto` режимов fallback кэшируется.
 
 ### `async connect(name: str) -> None`
 
@@ -133,15 +173,19 @@
 
 Поведение по типам БД:
 
-- **MySQL**:
+- **MySQL/MariaDB**:
   - создаёт `aiomysql` pool;
   - использует `utf8mb4` по умолчанию;
   - `autocommit=True`;
   - `cursorclass=aiomysql.DictCursor`;
-  - настраивает `init_command`:
-    - `readonly=True` и не MariaDB — `SET SESSION transaction_read_only = 1`;
-    - не readonly и не MariaDB — `SET SESSION MAX_EXECUTION_TIME=<timeout_ms>`;
-    - MariaDB (`is_mariadb=True`) — `init_command=None`, так как `MAX_EXECUTION_TIME` не поддерживается;
+  - `client_flag=CLIENT.MULTI_STATEMENTS`;
+  - `init_command` формируется из `init_statements` или автогенерируемых SET-запросов;
+  - если `init_statements` задан непустым списком, он полностью переопределяет автогенерацию; пустые строки отбрасываются. Если после отбрасывания строк не осталось, `init_command` будет `None`;
+  - если `init_statements` не задан или пустой список, выполняется автогенерация:
+    - при `readonly=True` добавляется `SET SESSION transaction_read_only = 1`;
+    - для MariaDB (`is_mariadb=True`) всегда добавляется `SET SESSION max_statement_time = <query_timeout>` в секундах;
+    - для MySQL всегда добавляется `SET SESSION MAX_EXECUTION_TIME = <query_timeout * 1000>` в миллисекундах;
+  - несколько SET-запросов объединяются через `"; "`;
   - размеры пула задаются через `minsize`/`maxsize` (по умолчанию `1`/`5`).
 
 - **PostgreSQL**:
@@ -183,7 +227,8 @@
 
 - при отсутствии пула автоматически вызывает `connect(name)`;
 - для MySQL используется `DictCursor`, результат возвращается как список словарей;
-- для PostgreSQL используется `conn.fetch()` с таймаутом `asyncpg`, результат приводится к `list[dict]`;
+- для MySQL запрос выполняется через `asyncio.wait_for` с таймаутом `query_timeout + 2`; при срабатывании выбрасывается `TimeoutError` с сообщением `Query timeout exceeded (<query_timeout> sec)`;
+- для PostgreSQL используется `conn.fetch()` с таймаутом `asyncpg`, результат приводится к `list[dict]`; при наличии `params` они передаются как `*params`;
 - для SQLite используется `pool.execute()`, затем `asyncio.wait_for(cursor.fetchall(), timeout=...)`;
 - для SQLite при таймауте выбрасывается `TimeoutError` с сообщением о превышении лимита;
 - курсор SQLite закрывается в `finally`;
@@ -251,7 +296,7 @@
 - безопасно вызывать повторно;
 - для объектов с `wait_closed` вызывает `close()` и `wait_closed()`;
 - для `aiosqlite.Connection` выполняет `commit()` перед `close()`;
-- неизвестные типы пытается закрыть через `close()`;
+- неизвестные типы пытается закрыть через `close()`, при необходимости ожидая coroutine;
 - ошибки закрытия логируются, но не прерывают закрытие остальных пулов;
 - после закрытия удаляет пулы из `self.pools` и очищает `self.pools`;
 - если `self.pools` был непустым, очищает `_schema_cache`.
@@ -267,6 +312,7 @@
 - `path` — для SQLite;
 - `readonly` — включает read-only режим;
 - `is_mariadb` — флаг для MySQL-совместимых MariaDB;
+- `init_statements` — список SQL-операторов для `init_command` MySQL. Если задан непустым, заменяет автогенерацию;
 - `minsize`, `maxsize` — размеры пула;
 - `charset` — кодировка MySQL;
 - `schemas` — список схем или `"auto"` для MySQL;
@@ -283,17 +329,19 @@
 
 ## Ограничения и важные замечания
 
-- MySQL `MAX_EXECUTION_TIME` поддерживается не всеми СУБД. Для MariaDB параметр не ставится, если в конфиге указан `is_mariadb: true`.
-- Если `is_mariadb` не указан, а СУБД фактически является MariaDB, код при `readonly=False` может попытаться выполнить `SET SESSION MAX_EXECUTION_TIME=...`. Отдельного `try/except` вокруг `create_pool`/`init_command` в коде нет, поэтому такая ошибка не проглатывается автоматически.
-- Для MySQL при `readonly=True` и не MariaDB выставляется `transaction_read_only`, но `MAX_EXECUTION_TIME` не устанавливается. Если нужны одновременно read-only и серверный таймаут, рекомендуется использовать пользователя БД только с правами `SELECT`.
-- Для MariaDB при `is_mariadb: true` `init_command=None`: read-only и таймаут на уровне `init_command` не настраиваются. Read-only следует обеспечивать правами пользователя БД или другими слоями.
-- PostgreSQL `statement_timeout` действует на стороне сервера. Дополнительно используется `command_timeout` asyncpg.
+- MySQL `MAX_EXECUTION_TIME` поддерживается не всеми СУБД. Для MariaDB используется `max_statement_time` в секундах.
+- Если `is_mariadb` не указан, а СУБД фактически является MariaDB, код при автогенерации попытается выполнить `SET SESSION MAX_EXECUTION_TIME=...`. Отдельного `try/except` вокруг `create_pool`/`init_command` в коде нет, поэтому такая ошибка не проглатывается автоматически.
+- В версии `261030.01` при автогенерации MySQL/MariaDB серверный таймаут ставится всегда, независимо от `readonly`. `transaction_read_only` ставится только при `readonly=true`.
+- Явно заданный непустой `init_statements` полностью переопределяет автогенерацию, включая установку read-only и серверного таймаута. Если в таком списке нет нужных SET-запросов, соответствующие настройки применены не будут.
+- MySQL использует `client_flag=CLIENT.MULTI_STATEMENTS`, поэтому несколько SET-запросов можно объединять через `"; "`.
+- Для MySQL дополнительно действует клиентский таймаут `asyncio.wait_for` с `query_timeout + 2`.
+- PostgreSQL `statement_timeout` действует на стороне сервера. Дополнительно используется `command_timeout` asyncpg и таймаут в `conn.fetch()`.
 - Если для PostgreSQL не задан `schemas`, `get_schemas()` использует fallback `[conf["database"]]`, а не `public`. Для получения таблиц PostgreSQL обычно нужно явно задать `schemas: ["public"]` или передать `schema="public"`.
 - SQLite read-only реализован через `PRAGMA query_only = ON`.
 - Для SQLite таймаут через `asyncio.wait_for` применяется к `cursor.fetchall()`, а не ко всей операции `execute()`.
 - Для SQLite имя таблицы в `PRAGMA table_info(...)` проверяется регуляркой, чтобы избежать небезопасной подстановки. Параметр `schema` в SQLite-запросах метаданных не используется.
 - Технические схемы, таблицы и колонки скрываются через `is_technical()` из `app.core.technical_filter`.
 - Параметр `params` в `execute_query` уже поддерживается менеджером, но, согласно комментариям, engine может пока его не использовать.
-- `get_table_list()` теперь возвращает fully-qualified имена `schema.table`, это breaking change. `get_table_schema()` при этом ожидает `table_name` без схемы и отдельный параметр `schema`.
+- `get_table_list()` возвращает fully-qualified имена `schema.table`, это breaking change. `get_table_schema()` при этом ожидает `table_name` без схемы и отдельный параметр `schema`.
 - Кэш метаданных имеет TTL по умолчанию `3600` секунд. После DDL-изменений стоит вызывать `invalidate_schema_cache(db_name)`.
 - `close()` при пустом `self.pools` сразу возвращается и не очищает `_schema_cache`; при непустом `self.pools` кэш очищается.

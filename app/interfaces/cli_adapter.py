@@ -53,8 +53,10 @@ class CLIAdapter(BaseChatInterface):
 
         print("=" * 60)
         print("repdix CLI")
-        print(f"user_id: {self.user_id}")
-        print("Команды: :help, :clear, :quit (или exit). Ctrl+C — отмена запроса.")
+        print(f"ADAPTER: {os.environ.get('ADAPTER', 'cli')!r}")
+        print(f"CLI_USER_ID: {self.user_id}")
+        print("Команды: :help, :clear, :quit (или exit). "
+              "Ctrl+C — отмена запроса.")
         print("=" * 60)
 
         while True:

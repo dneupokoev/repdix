@@ -3,6 +3,11 @@ dv_file_version = '261030.01'
 """Менеджер кэша на Redis (история диалогов, схема БД).
 
 Ключевые изменения версии 261030.01:
+- Убран retry_on_timeout — deprecated в redis-py 6.x, таймауты ретраятся
+  по умолчанию. Для redis-py 5.x поведение совместимо (там retry_on_timeout
+  не был критичен при заданных socket_timeout).
+
+Ключевые изменения версии 261030.01:
 - __init__ бросает ValueError, если Redis на не-loopback хосте настроен без
   пароля (защита от случайно открытого в сеть Redis, CVE-2025-21605).
   Локальные подключения (localhost / 127.0.0.1 / ::1) по-прежнему разрешены
@@ -86,7 +91,6 @@ class CacheManager:
             decode_responses=True,
             socket_timeout=socket_timeout,
             socket_connect_timeout=socket_connect_timeout,
-            retry_on_timeout=True,
         )
         self._closed = False
 

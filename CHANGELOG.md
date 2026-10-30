@@ -24,6 +24,13 @@
 ## [Unreleased]
 
 ### Added
+- feat: вырезать SQL-комментарии перед отправкой запроса в БД
+- feat: сделать порядок загрузки .env и выбора адаптера предсказуемым
+- feat: добавить диагностику выбора адаптера
+- feat: добавить сохранение сессии в Redis и исправить выбор схемы
+- feat: добавь настройку AGENT_MAX_STEPS и предупреждение о лимите
+- feat: добавить init_statements и MAX_EXECUTION_TIME для readonly MySQL
+- feat: разворачивать SELECT * в разрешённые поля RBAC
 - feat: добавить авто-сжатие истории и динамическую схему БД
 - feat: добавь HTML-разметку ответов и parse_mode в Telegram
 - feat: добавить поддержку правил вида "schema.*" в RBACGuard
@@ -36,11 +43,35 @@
 - feat: чистый релиз repdix (без секретов)
 
 ### Fixed
+- fix: убрать retry_on_timeout из Redis для устранения DeprecationWarning
+- fix: использовать fallback в /compact и аудит детерминированных веток
+- fix: безопасно читать user_id и current_db через getattr
+- fix: уточнить условие tools-fallback в chat()
+- fix: логировать неудачи развёртывания SELECT * в security-лог
+- fix: не блокировать `;` внутри SQL-комментариев
+- fix: добавить RBAC и фильтрацию в get_relations
+- fix: учитывать схему и экранировать идентификаторы в _try_get_last_date
+- fix: выставлять max_statement_time для MariaDB независимо от readonly
+- fix: выставить rbac_ok в admin-bypass для /sql и tool_call
+- fix: исправить обработку SQL-комментариев без пробела после --
 - fix: отправлять статусы с HTML-разметкой без обрезки тегов
 - fix: усилить правило вызова get_table_schema перед execute_sql
 
 ### Changed
+- refactor: удалить неиспользуемый метод _shorten_text из RepdixEngine
 - refactor: удалить deep_analysis_model, оставить tool_calling_model
 
 ### Documentation
+- docs: обновить комментарий о причине отказа от обрезки текста
+- docs: обновить docstrings session и engine, поднять версии до 261031.01
+- docs(doxdix): finalize SUMMARY.md
+- docs(doxdix): app/core/validator.py
+- docs(doxdix): update README.md
+- docs(doxdix): update CHANGELOG.md
+- docs: обнови README: таймауты MySQL/MariaDB и init_statements
 - docs: обновить комментарии и регулярное выражение для валидации SQL
+
+### Other
+- [non-conventional] ch
+- [non-conventional] ch
+- [non-conventional] ch

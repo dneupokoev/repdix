@@ -1,6 +1,16 @@
 # app/core/session.py
-dv_file_version = '261029.01'
+dv_file_version = '261030.01'
 """Состояние сессии пользователя для repdix.
+
+Ключевые изменения версии 261030.01:
+- summary и last_sqls сохраняются в Redis-ключе session:{user_id} вместе
+  с current_db/current_model (см. engine._persist_session).
+- docstring приведён в соответствие с кодом:
+  * cleanup() -> _cleanup_expired() (вызывается лениво из get() раз в
+    _cleanup_every обращений);
+  * lock — обычное dataclass-поле (default_factory=asyncio.Lock), а не
+    ленивое property;
+  * long_term_facts больше не «задел», а рабочая долговременная память.
 
 Ключевые изменения версии 261027.05:
 - WeakValueDictionary заменён на обычный dict с TTL. WeakValueDictionary
@@ -11,20 +21,22 @@ dv_file_version = '261029.01'
 - Добавлен TTL: сессия автоматически удаляется, если к ней не обращались
   SESSION_TTL_SEC (по умолчанию 24 часа, как и TTL истории в Redis).
 - Добавлен touch(): обновляет last_access. get() вызывает touch() сам.
-- Добавлен cleanup(): удаляет просроченные сессии и отменяет их current_task.
-  Вызывается лениво из get() (раз в N обращений), чтобы не держать
-  отдельную фоновую задачу.
+- Добавлен _cleanup_expired(): удаляет просроченные сессии и отменяет их
+  current_task. Вызывается лениво из get() раз в _cleanup_every обращений,
+  чтобы не держать отдельную фоновую задачу.
 - Добавлен clear_all(): для graceful shutdown / тестов.
 - В SessionState добавлено поле last_sqls (list[str]) — engine хранил SQL
   в history как [executed_sql], что засоряло контекст. Теперь — отдельный
   список, доступный через _extract_last_table_from_history (в engine).
 - В SessionState добавлено поле last_access (float, time.monotonic()).
-- SessionState.lock создаётся лениво (property), чтобы не тащить asyncio.Lock
-  в dataclass default (это работало, но некрасиво: Lock создавался в момент
-  конструирования dataclass, что при копировании/сериализации давало сюрпризы).
+- SessionState.lock — dataclass-поле с default_factory=asyncio.Lock;
+  создаётся при конструировании SessionState. Копировать/сериализовать
+  SessionState с lock нельзя.
 - В SessionState добавлены поля summary (краткое резюме старого диалога для
-  auto-compact) и long_term_facts (задел на долговременную память, пока
-  не используется).
+  auto-compact) и long_term_facts (факты долговременной памяти; используются
+  engine: Redis repdix:memory:{user_id}, TTL 30 дней. Загружаются в state
+  при входе в process_message и через _load_memory в callback-хэндлерах
+  адаптера).
 """
 
 import asyncio
