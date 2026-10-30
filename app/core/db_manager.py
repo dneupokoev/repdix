@@ -1,5 +1,5 @@
 # app/core/db_manager.py
-dv_file_version = '261030.08'
+dv_file_version = '261030.09'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite)."""
 
 import asyncio
@@ -447,7 +447,13 @@ class DBManager:
             )
             return
 
-        write_keywords = ("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER")
+        # Админские привилегии (FILE/SUPER/PROCESS/RELOAD/SHUTDOWN/EXECUTE)
+        # не дают записи в таблицы, но дают управление сервером — тоже
+        # должны попадать в security.log.
+        write_keywords = (
+            "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER",
+            "FILE", "SUPER", "PROCESS", "RELOAD", "SHUTDOWN", "EXECUTE",
+        )
 
         for row in rows or []:
             if not isinstance(row, dict):

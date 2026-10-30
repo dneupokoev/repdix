@@ -1,4 +1,4 @@
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 """Проверка сложности SQL-запроса ДО выполнения.
 
 Модуль закрывает класс запросов, которые формально безопасны (проходят
@@ -158,7 +158,14 @@ def check_complexity(
             )
 
     # 3. Глубина вложенности подзапросов
-    depth = _max_subquery_depth(tree)
+    # RecursionError на экстремально глубоком дереве — не SQLTooComplex,
+    # без этой обработки engine вернул бы «Ошибка LLM» (fail-open по UX).
+    try:
+        depth = _max_subquery_depth(tree)
+    except RecursionError:
+        raise SQLTooComplex(
+            "Слишком глубокая вложенность подзапросов. Уточните вопрос."
+        ) from None
     if depth > max_depth:
         raise SQLTooComplex(
             f"Слишком глубокая вложенность подзапросов "

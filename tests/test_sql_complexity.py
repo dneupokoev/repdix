@@ -128,3 +128,18 @@ def test_broken_sql_rejected_fail_closed() -> None:
         check_complexity("SELECT * FROM (", dialect="mysql")
 
     assert "разобрать" in exc_info.value.reason.lower()
+
+
+def test_recursion_error_becomes_sql_too_complex(monkeypatch) -> None:
+    """RecursionError в _max_subquery_depth → SQLTooComplex, не падение."""
+    def _boom(node, depth=0):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(
+        "app.core.sql_complexity._max_subquery_depth", _boom,
+    )
+
+    with pytest.raises(SQLTooComplex) as exc_info:
+        check_complexity("SELECT 1", dialect="mysql")
+
+    assert "вложенность подзапросов" in exc_info.value.reason.lower()

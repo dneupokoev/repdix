@@ -21,6 +21,9 @@
 - validator: DANGEROUS_PATTERNS ищутся только вне строковых литералов (ложные отказы на 'SET GLOBAL x') — app/core/validator.py
 - engine: неудача expand_select_star пишется в audit.log, а не в security.log — app/core/engine.py
 - engine.py: не подставлять в sql результат validate_sql, если это не SQL (защита от изменения контракта).
+- sql_complexity.py: RecursionError в _max_subquery_depth превращается в SQLTooComplex (fail-closed).
+- db_manager.py: _check_mysql_grants ловит FILE/SUPER/PROCESS/RELOAD/SHUTDOWN/EXECUTE.
+- main.py: load_dotenv вызывается до _setup_logging (LOG_MAX_BYTES из .env применяется).
 
 ## [2026-10-29]
 

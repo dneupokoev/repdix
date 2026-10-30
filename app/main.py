@@ -1,5 +1,5 @@
 # app/main.py
-dv_file_version = '261030.02'
+dv_file_version = '261030.03'
 """Точка входа repdix: выбор адаптера и запуск event loop"""
 
 import asyncio
@@ -172,19 +172,12 @@ def _build_adapter(engine: RepdixEngine):
 # ----------------------------------------------------------------------
 async def main() -> None:
     """Инициализация ядра и запуск выбранного адаптера."""
-    # ВАЖНО: логирование включаем ДО load_dotenv(), чтобы увидеть,
-    # что было в env до и после загрузки .env. pipenv run грузит .env
-    # раньше, чем main(), поэтому override=False не «спасает» — но
-    # debug-лог ниже покажет это явно.
-    _setup_logging()
-
-    logger.info(
-        "DEBUG main: ADAPTER до load_dotenv=%r",
-        os.environ.get("ADAPTER"),
-    )
     # override=False — документированное поведение python-dotenv:
     # явные env-переменные НЕ перезаписываются.
+    # load_dotenv ДО _setup_logging: иначе LOG_MAX_BYTES/SECURITY_LOG_*
+    # из .env не применяются (молча берутся дефолты).
     load_dotenv(override=False)
+    _setup_logging()
     logger.info(
         "DEBUG main: ADAPTER после load_dotenv=%r",
         os.environ.get("ADAPTER"),

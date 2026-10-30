@@ -84,7 +84,7 @@ repdix/
 │   ├── roles.yaml              # описание ролей и прав (RBAC)
 │   └── help.md                 # справка /help
 ├── data/                       # локальные данные (опционально)
-├── tests/                      # pytest (16 файлов, 183+ теста; см. раздел 10)
+├── tests/                      # pytest (17 файлов, 187+ тестов; см. раздел 10)
 ├── logs/                       # audit.log, security.log, manual_sql.log (ротация, НЕ КОММИТИТЬ)
 ├── .env                        # секреты (НЕ КОММИТИТЬ)
 └── .gitignore
@@ -395,12 +395,12 @@ databases:
 - **CLI-запуск через `pipenv run` + `ADAPTER=cli`:** `pipenv` перезапишет `ADAPTER` из `.env` на `telegram`. Используйте прямой запуск `.venv/bin/python -m app.main` или `PIPENV_DONT_LOAD_ENV=1`.
 
 ## 🧪 10. Тестирование
-Проект использует `pytest` + `pytest-asyncio`. **Фактическое покрытие: 16 файлов, 183+ теста** (проверяйте `pytest --collect-only -q tests/` — число может расти). Тесты покрывают:
+Проект использует `pytest` + `pytest-asyncio`. **Фактическое покрытие: 18 файлов, 190+ тестов** (проверяйте `pytest --collect-only -q tests/` — число может расти). Тесты покрывают:
 
 - **Валидатор SQL:** разрешённые/запрещённые запросы, комментарии, multiple statements, null bytes, fail-closed.
 - **RBAC:** qualified-таблицы, `SELECT *` + excluded/allowed, обход через смену схемы, системные таблицы, P2SQL, `COUNT(*)`, неквалифицированные колонки при нескольких таблицах, `expand_select_star`.
 - **SQL-сложность:** JOIN, декартово произведение, глубина подзапросов, UNION, fail-closed.
-- **Менеджер БД:** `init_command` (readonly + таймаут, MariaDB `max_statement_time`, `init_statements`, warning про `;`, `client_flag` MULTI_STATEMENTS только при `;`), `get_schemas` (explicit, fallback, auto, auto failure → `[]`), `get_table_list`, кэш, PostgreSQL `minsize`/`maxsize`, проверка `SHOW GRANTS` (read-only → нет WARNING; `ALL PRIVILEGES`/`INSERT` → WARNING в `security.log`; ошибка `SHOW GRANTS` → WARNING в app-лог, не падает).
+- **Менеджер БД:** `init_command` (readonly + таймаут, MariaDB `max_statement_time`, `init_statements`, warning про `;`, `client_flag` MULTI_STATEMENTS только при `;`), `get_schemas` (explicit, fallback, auto, auto failure → `[]`), `get_table_list`, кэш, PostgreSQL `minsize`/`maxsize`, проверка `SHOW GRANTS` (`tests/test_db_manager_grants.py`: read-only → нет WARNING; `ALL PRIVILEGES`/`INSERT` → WARNING в `security.log`; ошибка `SHOW GRANTS` → WARNING в app-лог, не падает).
 - **Ядро:** `_extract_table_from_sql` и `_extract_last_table_from_history` (кавычки, CTE, подзапросы, системные таблицы), `AGENT_MAX_STEPS`, `expand_select_star` (успех/неудача/логирование), кэш `text_columns`, защита от не-SQL `rbac_msg`.
 - **LLM-клиент:** кэширование клиентов, hot-reload, `_orphaned_clients` в `close()`.
 - **Сессии:** фоновая очистка TTL, идемпотентность `start_cleanup_task`/`stop_cleanup_task`, сохранение активных задач.

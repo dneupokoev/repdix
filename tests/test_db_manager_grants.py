@@ -212,3 +212,23 @@ def test_show_grants_failure_does_not_break_connect(
     assert any(
         "Не удалось проверить SHOW GRANTS" in msg for msg in app_warnings
     ), f"ожидался WARNING в app-логгере, получено: {app_warnings}"
+
+
+def test_file_privilege_logs_security_warning(
+    tmp_path: Path, caplog,
+) -> None:
+    """Админский FILE — WARNING в security.log."""
+    caplog.set_level(logging.WARNING, logger="security")
+
+    _connect(
+        tmp_path,
+        rows=[{
+            "Grants for repdix@%":
+                "GRANT SELECT, FILE ON *.* TO `repdix`@`%`",
+        }],
+    )
+
+    warnings = _security_warnings(caplog)
+    assert any("write privileges" in msg for msg in warnings), (
+        f"ожидался WARNING про write privileges, получено: {warnings}"
+    )
