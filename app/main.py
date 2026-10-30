@@ -1,35 +1,6 @@
 # app/main.py
 dv_file_version = '261028.10'
-"""Точка входа repdix: выбор адаптера и запуск event loop.
-
-Ключевые изменения версии 261028.08:
-- Ротация logs/security.log (раньше писался без ограничения размера —
-  файл рос бесконечно). Формат — RotatingFileHandler, размер/бэкапы из env
-  (SECURITY_LOG_MAX_BYTES / SECURITY_LOG_BACKUP_COUNT), дефолт 50MB × 5.
-- ДОБАВЛЕН вызов engine.sessions.clear_all() на shutdown — иначе висящие
-  asyncio.Task (если пользователь запустил анализ и процесс упал) не
-  отменяются, и event loop ругается "Task was destroyed but it is pending".
-- close() вызывается с try/except: если что-то упало при закрытии — процесс
-  всё равно завершается, а не висит. Раньше одно исключение в
-  engine.db_manager.close() блокировало закрытие llm/cache/adapter.
-- logger.error на старте, если ADAPTER неизвестен (было молчаливое
-  переключение на CLI).
-- logger.warning, если TELEGRAM_TOKEN не задан при ADAPTER=telegram.
-- Проверка, что Redis доступен (ping) при старте — быстрый fail-fast,
-  вместо падения на первом запросе.
-- Логирование версии dv_file_version при старте (для аудита, какая версия
-  запущена).
-- Импорт UserManager вынесен наверх (был внутри main — «на горячую»,
-  что мешает статическому анализу).
-- os.makedirs('logs', exist_ok=True) с проверкой прав (try/except).
-- В RotatingFileHandler добавлен delay=True — файл открывается при первой
-  записи, а не при старте (полезно, если бот запускается, но не пишет).
-- Форматирование: единый стиль импортов, пустые строки по PEP8.
-- Graceful shutdown: SIGINT/SIGTERM перехватываются aiogram/cli, но
-  добавлена защита — если adapter.start() бросил, finally всё равно
-  всё закроет.
-- Если adapter.close() не реализован — вызывается через hasattr (как было).
-"""
+"""Точка входа repdix: выбор адаптера и запуск event loop"""
 
 import asyncio
 import logging

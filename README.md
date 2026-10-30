@@ -16,7 +16,7 @@
 - **Базы данных:** `aiomysql` (MySQL), `asyncpg` (PostgreSQL), `aiosqlite` (SQLite).
 - **Кэширование:** `redis.asyncio`.
 - **Конфигурация:** `python-dotenv` и `PyYAML`.
-- **Парсер SQL:** `sqlglot` (диалект mysql для RBAC-разбора).
+- **Парсер SQL:** `sqlglot` (диалект mysql для RBAC-разбора и проверки сложности).
 
 ## 🏗️ 3. Архитектура (Порты и Адаптеры)
 Ядро ничего не знает о Telegram. Общение идёт через абстрактные интерфейсы.
@@ -30,25 +30,30 @@ repdix/
 │   │                           # адаптера (telegram/cli), диагностика выбора, graceful shutdown
 │   ├── core/                   # бизнес-логика (независима от мессенджера)
 │   │   ├── __init__.py
+│   │   ├── cache_manager.py    # Redis (история диалогов, graceful degradation);
+│   │   │                       # клиент без retry_on_timeout для устранения DeprecationWarning
+│   │   ├── db_manager.py       # пулы соединений (MySQL/PostgreSQL/SQLite), таймауты,
+│   │   │                       # read-only, init_statements, метаданные, multi-schema,
+│   │   │                       # lock_wait_timeout для MySQL/MariaDB,
+│   │   │                       # выполнение запросов без SQL-комментариев
 │   │   ├── engine.py           # ядро: Agent Loop, tool_calls, RBAC, формирование промпта
 │   │   │                       # (включая правило обрамления идентификаторов MySQL),
 │   │   │                       # динамическая схема БД, авто-сжатие истории,
 │   │   │                       # авто-развёртывание SELECT *, безопасное чтение
-│   │   │                       # user_id/current_db через getattr
-│   │   ├── session.py          # SessionState (история, lock, current_task, last_sqls,
-│   │   │                       # summary, long_term_facts) + SessionStore с TTL
-│   │   ├── db_manager.py       # пулы соединений (MySQL/PostgreSQL/SQLite), таймауты,
-│   │   │                       # read-only, init_statements, метаданные, multi-schema,
-│   │   │                       # выполнение запросов без SQL-комментариев
-│   │   ├── user_manager.py     # управление доступом (hot-reload users.yaml),
-│   │   │                       # add/approve/reject/delete
+│   │   │                       # user_id/current_db через getattr,
+│   │   │                       # вызов check_complexity перед выполнением SQL
 │   │   ├── llm_client.py       # клиент LLM (hot-reload models.yaml, temperature,
 │   │   │                       # max_tokens, fallback tools)
-│   │   ├── cache_manager.py    # Redis (история диалогов, graceful degradation);
-│   │   │                       # клиент без retry_on_timeout для устранения DeprecationWarning
+│   │   ├── manual_sql_audit.py # аудит ручных /sql-вызовов в logs/manual_sql.log
 │   │   ├── rbac_guard.py       # проверка прав доступа к таблицам и полям (sqlglot AST),
 │   │   │                       # правила schema.*, защита от P2SQL, expand_select_star
+│   │   ├── session.py          # SessionState (история, lock, current_task, last_sqls,
+│   │   │                       # summary, long_term_facts) + SessionStore с TTL
+│   │   ├── sql_complexity.py   # проверка сложности SQL на уровне AST (JOIN, декартово
+│   │   │                       # произведение, глубина подзапросов, UNION); пороги из env
 │   │   ├── technical_filter.py # фильтрация технических таблиц/колонок (TECHNICAL_PREFIXES)
+│   │   ├── user_manager.py     # управление доступом (hot-reload users.yaml),
+│   │   │                       # add/approve/reject/delete
 │   │   └── validator.py        # SQL-валидатор (только SELECT/WITH, forbidden keywords,
 │   │                           # fail-closed, комментарии без пробела после --)
 │   └── interfaces/             # адаптеры мессенджеров
@@ -69,22 +74,24 @@ repdix/
 │   └── help.md                 # справка /help
 ├── data/                       # локальные данные (опционально)
 ├── tests/                      # pytest
-├── logs/                       # audit.log, security.log (ротация, НЕ КОММИТИТЬ)
+├── logs/                       # audit.log, security.log, manual_sql.log (ротация, НЕ КОММИТИТЬ)
 ├── .env                        # секреты (НЕ КОММИТИТЬ)
 └── .gitignore
 ```
 
 ### 3.1. Ключевые модули
 - `app/main.py` — запуск приложения, инициализация сервисов, загрузка `.env` до выбора адаптера, предсказуемый выбор адаптера (`telegram` или `cli`), диагностика выбора в логах, корректное завершение.
-- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`.
+- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, вызов `sql_complexity.check_complexity` перед выполнением SQL, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`.
 - `app/core/session.py` — состояние сессии, история, блокировки, активные задачи, резюме диалога (`summary`), долгосрочная память (`long_term_facts`) и TTL-хранилище сессий.
-- `app/core/db_manager.py` — пулы подключений к MySQL/PostgreSQL/SQLite, таймауты, read-only-режим, `init_statements`, кэш метаданных и поддержка нескольких схем (`multi-schema`). Перед отправкой запроса в БД SQL-комментарии вырезаются.
+- `app/core/db_manager.py` — пулы подключений к MySQL/PostgreSQL/SQLite, таймауты, `lock_wait_timeout` (MySQL/MariaDB), read-only-режим, `init_statements`, кэш метаданных и поддержка нескольких схем (`multi-schema`). Перед отправкой запроса в БД SQL-комментарии вырезаются.
 - `app/core/llm_client.py` — клиент LLM, hot-reload `models.yaml`, `max_tokens`, `temperature`, fallback-инструменты.
 - `app/core/cache_manager.py` — Redis-кэш истории диалогов, graceful degradation при недоступности Redis. Redis-клиент создаётся без `retry_on_timeout` для устранения `DeprecationWarning`.
 - `app/core/rbac_guard.py` — контроль доступа к таблицам и полям на основе AST `sqlglot`, правила вида `schema.*`, блокировка системных таблиц и `SELECT *` при наличии ограничений, метод `expand_select_star` для авто-развёртывания звёздочки в разрешённые поля.
+- `app/core/sql_complexity.py` — проверка сложности SQL на уровне AST: количество `JOIN`, наличие `JOIN` без условия (декартово произведение), максимальная глубина вложенности `Subquery`, количество `UNION`. Пороги задаются через env (`SQL_MAX_JOINS`, `SQL_MAX_SUBQUERY_DEPTH`, `SQL_MAX_UNIONS`). При превышении — `SQLTooComplex`, запрос не выполняется, модели возвращается tool-сообщение с причиной.
 - `app/core/technical_filter.py` — скрытие технических таблиц и колонок по префиксам из `TECHNICAL_PREFIXES`.
 - `app/core/validator.py` — проверка SQL: только `SELECT`/`WITH`, запрещённые ключевые слова, fail-closed парсинг через `sqlglot`, корректная обработка SQL-комментариев без пробела после `--`.
 - `app/core/user_manager.py` — модерация пользователей, hot-reload `users.yaml`, защита администраторов.
+- `app/core/manual_sql_audit.py` — аудит ручных `/sql`-вызовов в отдельный `logs/manual_sql.log` (полный SQL, `user_id`, `db_name`, длительность, результат). Ограничений на сложность `/sql` нет (осознанное решение владельца).
 - `app/interfaces/base.py` — абстрактные интерфейсы сообщений (`ChatMessage`) и ответов (`ChatResponse`, включая `reply_markup`).
 - `app/interfaces/telegram_adapter.py` — Telegram-адаптер: FSM-регистрация, HTML-разметка ответов (`parse_mode`), санитайзер HTML, отправка статусов с HTML-разметкой, кнопки управления памятью, `/stop`, модерация.
 - `app/interfaces/cli_adapter.py` — консольный адаптер для отладки.
@@ -92,32 +99,56 @@ repdix/
 ### 3.2. Поток обработки запроса
 1. Адаптер (`telegram_adapter.py` или `cli_adapter.py`) принимает сообщение пользователя и передаёт его в ядро.
 2. `engine.py` формирует системный промпт с учётом динамической схемы БД, истории, долгосрочной памяти и RBAC-правил.
-3. LLM вызывает инструменты (`execute_sql`, `get_relations`), ядро валидирует SQL через `validator.py`, проверяет доступ через `rbac_guard.py` и скрывает технические объекты через `technical_filter.py`. При отказе RBAC именно из-за `SELECT *` (при наличии `allowed_columns`/`excluded_columns`) ядро пытается развернуть звёздочку в разрешённые поля и повторить валидацию.
-4. `db_manager.py` выполняет запрос в целевой БД с учётом таймаутов и read-only-режима. Перед отправкой запроса SQL-комментарии вырезаются.
+3. LLM вызывает инструменты (`execute_sql`, `get_relations`), ядро валидирует SQL через `validator.py`, проверяет доступ через `rbac_guard.py`, проверяет сложность через `sql_complexity.py` и скрывает технические объекты через `technical_filter.py`. При отказе RBAC именно из-за `SELECT *` (при наличии `allowed_columns`/`excluded_columns`) ядро пытается развернуть звёздочку в разрешённые поля и повторить валидацию. При отказе `check_complexity` запрос **не выполняется**, модели возвращается tool-сообщение с причиной, чтобы она переформулировала запрос или попросила пользователя уточнить вопрос.
+4. `db_manager.py` выполняет запрос в целевой БД с учётом таймаутов, `lock_wait_timeout` и read-only-режима. Перед отправкой запроса SQL-комментарии вырезаются.
 5. Статусы Chain of Thought отправляются через `status_callback`; ответ пользователю рендерится адаптером (в Telegram — с `parse_mode=HTML`).
 
 ## 🗄️ 4. Работа с базами данных
 - **Шаблоны в `config/databases.yaml`**: реальные значения подставляются из `.env` через `${VAR}`.
-- **Ограничения на стороне СУБД.** Бот должен работать под пользователем БД, у которого есть **только права `SELECT`**. `readonly: true` и валидатор SQL — дополнительные барьеры, но **не замена** правам на уровне БД (см. раздел 4.1).
+- **Ограничения на стороне СУБД.** Бот должен работать под пользователем БД, у которого есть **только права `SELECT`**. `readonly: true`, валидатор SQL и проверка сложности — дополнительные барьеры, но **не замена** правам на уровне БД (см. раздел 4.1).
 - **SQL-комментарии:** перед отправкой запроса в БД комментарии вырезаются; валидатор при этом корректно обрабатывает SQL-комментарии, в том числе без пробела после `--`.
 - **Таймауты:** `SQL_QUERY_TIMEOUT` (по умолчанию 15 секунд) прерывает тяжёлые запросы:
   - **MySQL:** `SET SESSION MAX_EXECUTION_TIME` (только MySQL 5.7.8+, не MariaDB). Ставится через `init_command` при создании пула — то есть на каждое соединение, в том числе при `readonly: true` (несколько простых `SET SESSION` склеиваются в один запрос).
   - **MariaDB:** вместо `MAX_EXECUTION_TIME` бот автоматически выставляет `SET SESSION max_statement_time` (в секундах).
   - **PostgreSQL:** `statement_timeout` в `server_settings` (прерывает запрос на стороне сервера).
   - **SQLite:** `asyncio.wait_for` вокруг `cursor.fetchall()`.
+- **Ожидание блокировок (MySQL/MariaDB):** `MAX_EXECUTION_TIME` и `max_statement_time` **не запускают таймер**, пока запрос ждёт блокировку. Поэтому в тот же `init_command` добавляются:
+  - `SET SESSION innodb_lock_wait_timeout = <LOCK_WAIT_TIMEOUT>` — ограничивает ожидание InnoDB row-level lock;
+  - `SET SESSION lock_wait_timeout = <LOCK_WAIT_TIMEOUT>` — ограничивает ожидание metadata lock (MDL).
+  Значение `LOCK_WAIT_TIMEOUT` берётся из env (по умолчанию 5 секунд). Если значение <= 0 — используется 5 и пишется warning в лог. Для PostgreSQL/SQLite эти команды не добавляются.
 - **Режим транзакций read-only (выставляется при `readonly: true`):**
-  - **MySQL:** `SET SESSION transaction_read_only = 1` (при `readonly: true`, включая MariaDB). Серверный таймаут выставляется в том же `init_command`: несколько `SET SESSION` склеиваются через `; ` и выполняются благодаря `CLIENT.MULTI_STATEMENTS`. Пользователь БД с правами только `SELECT` по-прежнему рекомендуется как основной барьер.
+  - **MySQL:** `SET SESSION transaction_read_only = 1` (при `readonly: true`, включая MariaDB). Серверный таймаут и `lock_wait_timeout` выставляются в том же `init_command`: несколько `SET SESSION` склеиваются через `; ` и выполняются благодаря `CLIENT.MULTI_STATEMENTS`. Пользователь БД с правами только `SELECT` по-прежнему рекомендуется как основной барьер.
   - **PostgreSQL:** `default_transaction_read_only = on` в `server_settings`.
   - **SQLite:** `PRAGMA query_only = ON`.
-- **MariaDB:** установите `is_mariadb: true` в `databases.yaml`. Бот не будет ставить `MAX_EXECUTION_TIME` (MariaDB его не понимает) и вместо него выполнит `SET SESSION max_statement_time = <SQL_QUERY_TIMEOUT>`.
+- **MariaDB:** установите `is_mariadb: true` в `databases.yaml`. Бот не будет ставить `MAX_EXECUTION_TIME` (MariaDB его не понимает) и вместо него выполнит `SET SESSION max_statement_time = <SQL_QUERY_TIMEOUT>`. `innodb_lock_wait_timeout` и `lock_wait_timeout` ставятся и для MariaDB.
 - **Multi-schema:** одна MySQL-БД может содержать несколько схем. Список задаётся в `databases.yaml` (`schemas: auto` или явный список), исключения — `exclude_schemas`. Результат кэшируется на `SCHEMA_CACHE_TTL_SEC` (по умолчанию 3600 сек). Таблицы в промпте и в `get_table_list()` возвращаются fully-qualified (`schema.table`); `get_table_schema()` принимает `(db, table, schema)`.
-- **init_statements:** необязательный список SQL-команд в `databases.yaml`, которые выполняются при создании **каждого** соединения MySQL-пула. Поддерживается подстановка `{timeout}` (= `SQL_QUERY_TIMEOUT`, сек). Readonly и таймаут бот выставляет сам; `init_statements` — только для дополнительных настроек сессии. «Простые» `SET SESSION` склеиваются в один запрос, при наличии других команд автоматически включается `CLIENT.MULTI_STATEMENTS`.
+- **init_statements:** необязательный список SQL-команд в `databases.yaml`, которые выполняются при создании **каждого** соединения MySQL-пула. Поддерживается подстановка `{timeout}` (= `SQL_QUERY_TIMEOUT`, сек). Readonly, таймаут и `lock_wait_timeout` бот выставляет сам; `init_statements` — только для дополнительных настроек сессии. «Простые» `SET SESSION` склеиваются в один запрос, при наличии других команд автоматически включается `CLIENT.MULTI_STATEMENTS`.
 
 ### 4.1. 🔐 Безопасность базы данных
 
 ⚠️ **ВАЖНО:** Для безопасности бот должен подключаться к базе данных под пользователем, у которого есть **ТОЛЬКО права на `SELECT` (чтение)**. Параметр `readonly: true` в `databases.yaml` **не заменяет** права БД, он лишь выставляет режим транзакций (`SET SESSION transaction_read_only = 1`, `default_transaction_read_only = on`, `PRAGMA query_only = ON`). Если у пользователя БД есть права на запись, скомпрометированная LLM может изменить данные.
 
-Валидатор SQL (`validate_sql`) и RBAC-гард — лишь дополнительный барьер; они не заменяют ограничения прав на стороне СУБД и не гарантируют неизменность данных.
+Валидатор SQL (`validate_sql`), RBAC-гард и проверка сложности (`check_complexity`) — лишь дополнительный барьер; они не заменяют ограничения прав на стороне СУБД и не гарантируют неизменность данных.
+
+### 4.2. 🩺 Диагностика тяжёлых запросов (`slow_query_log`) — на стороне админа БД
+
+`MAX_EXECUTION_TIME`, `max_statement_time`, `statement_timeout` и `lock_wait_timeout` — это **защита**, но она не всегда срабатывает (например, запрос может «проскочить» проверку таймера в некоторых фазах выполнения). Для **диагностики** инцидентов админу БД рекомендуется включить `slow_query_log`:
+
+**MySQL:**
+```sql
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 30;          -- порог в секундах
+SET GLOBAL slow_query_log_file = '/var/log/mysql/slow.log';
+-- Опционально: логировать и запросы без индексов
+SET GLOBAL log_queries_not_using_indexes = 'ON';
+```
+
+**MariaDB:** аналогично, но имя файла может отличаться в зависимости от сборки; проверьте `SHOW VARIABLES LIKE 'slow_query_log_file';`.
+
+**Рекомендации:**
+- Подключить бота под **отдельным пользователем БД** (например, `repdix_ro`), чтобы в `slow.log` было видно `user: repdix_ro` и алерт срабатывал именно на запросы бота, а не на всю БД.
+- Настроить внешний алерт (например, `pt-query-digest` раз в 5 минут или простой скрипт, который парсит `slow.log` и шлёт уведомление при `Query_time > 30`).
+- **`slow_query_log` — это диагностика, а не защита.** Он не остановит запрос. Он нужен, чтобы **после** инцидента понять, что произошло.
 
 ## 🧠 5. Работа с моделями и AI-Агент
 
@@ -133,7 +164,7 @@ repdix/
 
 ### 5.3. Инструменты модели (Tool Calling)
 Доступны инструменты:
-- `execute_sql` — для сложных аналитических SELECT-запросов.
+- `execute_sql` — для сложных аналитических SELECT-запросов. Перед выполнением проходит `validator.validate_sql`, `rbac_guard.validate_sql` и `sql_complexity.check_complexity`.
 - `get_relations` — узнать связи таблиц.
 - **⚠️ Важно:** `SHOW COLUMNS` и `SHOW TABLES` **не пройдут** `validator.validate_sql` — только `SELECT` и `WITH`. Вся нужная информация о структуре уже в промпте (динамическая схема).
 
@@ -166,7 +197,7 @@ repdix/
 | `/db`, `/db <name>` | Текущая БД / выбор новой. |
 | `/model`, `/model <name>` | Текущая модель / переключение (регистронезависимо). |
 | `/models` | Список доступных моделей. |
-| `/sql <query>` | Выполнить SQL вручную (только для одобренных, проходит validator + RBAC). |
+| `/sql <query>` | Выполнить SQL вручную (только для одобренных, проходит validator + RBAC). **Ограничение сложности (`check_complexity`) к `/sql` не применяется** (осознанное решение владельца). Каждый вызов пишется в `logs/manual_sql.log` (полный SQL, `user_id`, `db_name`, длительность, результат) через `app/core/manual_sql_audit.py`. |
 | `/history` | Показать историю диалога. |
 | `/compact` | Сжать историю (LLM-резюме; при недоступности LLM используется fallback). |
 | `/clear` | Полностью очистить историю (память сохраняется). |
@@ -221,12 +252,18 @@ REDIS_PASSWORD=
 
 # Лимиты
 SQL_QUERY_TIMEOUT=15
+LOCK_WAIT_TIMEOUT=5             # ожидание блокировки (MySQL/MariaDB), сек
 MAX_ROWS_IN_RESPONSE=100
 MAX_MESSAGE_LENGTH=4000
 SESSION_TTL_SEC=86400       # 24 часа
 AGENT_MAX_STEPS=10          # лимит шагов Agent Loop (минимум 1)
 SHOW_MODEL_IN_RESPONSE=false
 SCHEMA_CACHE_TTL_SEC=3600       # TTL кэша схемы БД (сек)
+
+# Проверка сложности SQL (check_complexity)
+SQL_MAX_JOINS=5
+SQL_MAX_SUBQUERY_DEPTH=3
+SQL_MAX_UNIONS=3
 
 # Скрытые (технические) таблицы/колонки
 TECHNICAL_PREFIXES=technical_       # CSV-префиксы скрытых таблиц/колонок
@@ -235,7 +272,7 @@ TECHNICAL_PREFIXES=technical_       # CSV-префиксы скрытых таб
 DEFAULT_CONTEXT_LENGTH=32768
 
 # Логи (ротация)
-LOG_MAX_BYTES=104857600         # 100 MB (audit.log)
+LOG_MAX_BYTES=104857600         # 100 MB (audit.log, manual_sql.log)
 LOG_BACKUP_COUNT=5
 SECURITY_LOG_MAX_BYTES=52428800 # 50 MB (security.log)
 SECURITY_LOG_BACKUP_COUNT=5

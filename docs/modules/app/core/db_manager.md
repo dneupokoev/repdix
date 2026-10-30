@@ -15,7 +15,17 @@
 - скрытие технических сущностей через `technical_filter`;
 - безопасное закрытие соединений.
 
-Версия файла в коде: `261030.01`.
+Версия файла в коде: `261030.02`.
+
+Ключевые изменения версии `261030.02`:
+
+- Добавлен параметр `lock_wait_timeout`, читаемый из `LOCK_WAIT_TIMEOUT` (по умолчанию `5` секунд).
+- Некорректное или неположительное значение `LOCK_WAIT_TIMEOUT` заменяется на `5` с записью warning в лог.
+- MySQL/MariaDB: при автогенерации `init_statements` всегда добавляются:
+  - `SET SESSION innodb_lock_wait_timeout = <lock_wait_timeout>`;
+  - `SET SESSION lock_wait_timeout = <lock_wait_timeout>`.
+- Ограничения ожидания блокировок применяются и для MySQL, и для MariaDB, и в режиме `readonly=true`.
+- Явно заданный непустой `init_statements` по-прежнему полностью переопределяет автогенерацию, включая lock wait timeouts.
 
 Ключевые изменения версии `261030.01`:
 
@@ -95,6 +105,7 @@
 - `config` — загруженная конфигурация;
 - `query_timeout` — таймаут SQL-запроса в секундах. Берётся из `SQL_QUERY_TIMEOUT`, по умолчанию `15`;
 - `schema_cache_ttl` — TTL кэша метаданных в секундах. Берётся из `SCHEMA_CACHE_TTL_SEC`, по умолчанию `3600`; при некорректном значении используется `3600`;
+- `lock_wait_timeout` — таймаут ожидания блокировок MySQL/MariaDB в секундах. Берётся из `LOCK_WAIT_TIMEOUT`, по умолчанию `5`; при некорректном значении или значении `<= 0` используется `5` с записью warning в лог;
 - `_schema_cache` — внутренний кэш метаданных: ключ-кортеж → `(monotonic_timestamp, data)`.
 
 При инициализации вызывает `load_config()`.
@@ -181,10 +192,12 @@
   - `client_flag=CLIENT.MULTI_STATEMENTS`;
   - `init_command` формируется из `init_statements` или автогенерируемых SET-запросов;
   - если `init_statements` задан непустым списком, он полностью переопределяет автогенерацию; пустые строки отбрасываются. Если после отбрасывания строк не осталось, `init_command` будет `None`;
-  - если `init_statements` не задан или пустой список, выполняется автогенерация:
+  - если `init_statements` не задан или является пустым списком, выполняется автогенерация:
     - при `readonly=True` добавляется `SET SESSION transaction_read_only = 1`;
     - для MariaDB (`is_mariadb=True`) всегда добавляется `SET SESSION max_statement_time = <query_timeout>` в секундах;
     - для MySQL всегда добавляется `SET SESSION MAX_EXECUTION_TIME = <query_timeout * 1000>` в миллисекундах;
+    - всегда добавляется `SET SESSION innodb_lock_wait_timeout = <lock_wait_timeout>`;
+    - всегда добавляется `SET SESSION lock_wait_timeout = <lock_wait_timeout>`;
   - несколько SET-запросов объединяются через `"; "`;
   - размеры пула задаются через `minsize`/`maxsize` (по умолчанию `1`/`5`).
 
@@ -319,6 +332,12 @@
 - `exclude_schemas` — список схем, исключаемых в MySQL-режиме `schemas: "auto"`;
 - `description` — описание БД для `get_db_description()` и `get_db_display_name()`.
 
+Переменные окружения:
+
+- `SQL_QUERY_TIMEOUT` — таймаут SQL-запроса в секундах, по умолчанию `15`;
+- `SCHEMA_CACHE_TTL_SEC` — TTL кэша метаданных в секундах, по умолчанию `3600`;
+- `LOCK_WAIT_TIMEOUT` — таймаут ожидания блокировок MySQL/MariaDB в секундах, по умолчанию `5`.
+
 Значения вида `${VAR}` подставляются из переменных окружения. Если переменная не найдена, подставляется пустая строка с записью warning в лог.
 
 ## Использование другими модулями проекта
@@ -332,7 +351,8 @@
 - MySQL `MAX_EXECUTION_TIME` поддерживается не всеми СУБД. Для MariaDB используется `max_statement_time` в секундах.
 - Если `is_mariadb` не указан, а СУБД фактически является MariaDB, код при автогенерации попытается выполнить `SET SESSION MAX_EXECUTION_TIME=...`. Отдельного `try/except` вокруг `create_pool`/`init_command` в коде нет, поэтому такая ошибка не проглатывается автоматически.
 - В версии `261030.01` при автогенерации MySQL/MariaDB серверный таймаут ставится всегда, независимо от `readonly`. `transaction_read_only` ставится только при `readonly=true`.
-- Явно заданный непустой `init_statements` полностью переопределяет автогенерацию, включая установку read-only и серверного таймаута. Если в таком списке нет нужных SET-запросов, соответствующие настройки применены не будут.
+- В версии `261030.02` при автогенерации MySQL/MariaDB всегда ставятся `innodb_lock_wait_timeout` и `lock_wait_timeout` на уровне сессии.
+- Явно заданный непустой `init_statements` полностью переопределяет автогенерацию, включая установку read-only, серверного таймаута и lock wait timeouts. Если в таком списке нет нужных SET-запросов, соответствующие настройки применены не будут.
 - MySQL использует `client_flag=CLIENT.MULTI_STATEMENTS`, поэтому несколько SET-запросов можно объединять через `"; "`.
 - Для MySQL дополнительно действует клиентский таймаут `asyncio.wait_for` с `query_timeout + 2`.
 - PostgreSQL `statement_timeout` действует на стороне сервера. Дополнительно используется `command_timeout` asyncpg и таймаут в `conn.fetch()`.
@@ -345,3 +365,5 @@
 - `get_table_list()` возвращает fully-qualified имена `schema.table`, это breaking change. `get_table_schema()` при этом ожидает `table_name` без схемы и отдельный параметр `schema`.
 - Кэш метаданных имеет TTL по умолчанию `3600` секунд. После DDL-изменений стоит вызывать `invalidate_schema_cache(db_name)`.
 - `close()` при пустом `self.pools` сразу возвращается и не очищает `_schema_cache`; при непустом `self.pools` кэш очищается.
+- `SQL_QUERY_TIMEOUT` читается без `try/except`; некорректное значение приведёт к исключению при инициализации `DBManager`.
+- `LOCK_WAIT_TIMEOUT` и `SCHEMA_CACHE_TTL_SEC` при некорректных значениях используют безопасные значения по умолчанию (`5` и `3600` соответственно).

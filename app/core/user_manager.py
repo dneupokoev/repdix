@@ -1,28 +1,6 @@
 # app/core/user_manager.py
 dv_file_version = '261028.05'
-"""Управление пользователями repdix через config/users.yaml.
-
-Ключевые изменения версии 261028.05:
-- ДОБАВЛЕНО поле telegram_name. Раньше update_user_profile перезаписывал
-  full_name (ФИО из регистрации) на Telegram-имя при каждом /start —
-  данные терялись. Теперь ФИО из регистрации хранится в full_name и НЕ
-  перезаписывается, а Telegram-имя — в отдельном поле telegram_name.
-- ДОБАВЛЕНЫ методы для админ-панели:
-    * list_users(exclude_admins=True) — список пользователей (dict).
-    * list_users_paginated(page, per_page, exclude_admins=True) — постранично.
-    * set_user_roles(user_id, roles) — ЗАМЕНИТЬ роли (не добавить).
-    * toggle_user_active(user_id) -> (ok, new_active) — переключить is_active.
-    * set_user_full_name(user_id, full_name) — изменить ФИО вручную (админ).
-- update_user_profile теперь обновляет username и telegram_name,
-  full_name НЕ трогает. Это исправляет баг с потерей ФИО.
-- _USERS_HEADER дополнен описанием telegram_name.
-- add_user и sync_admins создают запись с telegram_name: "".
-- Валидация: set_user_roles / toggle_user_active не трогают env-админов.
-- list_users сортирует по (is_active desc, full_name asc) для удобства.
-- set_user_roles: если roles=None или [] — сохраняет пустой список (это
-  валидное состояние: пользователь активен, но без доступа к таблицам).
-- toggle_user_active не позволяет заблокировать env-админа.
-"""
+"""Управление пользователями repdix через config/users.yaml"""
 
 import asyncio
 import logging

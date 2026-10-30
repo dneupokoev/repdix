@@ -1,198 +1,6 @@
 # app/core/engine.py
-dv_file_version = '261030.01'
-"""Ядро repdix: диспетчер сообщений, не зависящий от мессенджера.
-
-Ключевые изменения версии 261030.01:
-- AGENT_MAX_STEPS читается из env (fallback 10, минимум 1); при выходе
-  по лимиту пишется WARNING "Agent loop reached max_steps".
-- Состояние сессии (current_db, current_model, summary, last_sqls)
-  зеркалится в Redis-ключе session:{user_id} через _persist_session();
-  читается при входе в process_message.
-- default_schema пересчитывается ПОСЛЕ загрузки кэша — раньше для MySQL
-  он был всегда "public".
-- Исправлен admin-bypass в /sql и tool_call execute_sql: при отказе RBAC
-  для админа явно ставится rbac_ok=True (раньше управление проваливалось
-  в выполнение без нормализации).
-- get_relations в tool-loop фильтрует технические таблицы/колонки и
-  проверяет RBAC через validate_sql.
-- _try_get_last_date: schema и имена колонок/таблиц квотируются по
-  диалекту БД (_quote_ident), для MySQL — обратные кавычки
-  (SELECT MAX(`date`) ...).
-- _try_expand_select_star: при неудаче/повторном отказе пишет
-  log_violation (expand_select_star failed / rejected).
-- Защита от _FakeState в тестах: user_id_for_log через getattr.
-
-Ключевые изменения версии 261030.04:
-- Состояние сессии зеркалится в Redis: ключ session:{user_id}
-  ({"current_db", "current_model", "summary", "last_sqls"}, TTL 24 часа).
-  Пишется через _persist_session() в /db <name>, /model <name>, /compact,
-  /reset, /clear; читается при входе в process_message (битый/отсутствующий
-  ключ не сбрасывает значения, уже установленные в этой сессии).
-- default_schema пересчитывается ПОСЛЕ загрузки кэша: раньше он вычислялся
-  до восстановления current_db (всегда None) и для MySQL получалось
-  "public" вместо имени базы.
-- Восстановленная БД проверяется по db_manager.get_db_names(): удалённая
-  из конфига БД не попадает в состояние.
-
-Ключевые изменения версии 261030.03:
-- SELECT * по таблице с ограниченным набором полей больше не тупик: если
-  validate_sql отказал именно из-за звёздочки, движок пробует развернуть её
-  в явный список разрешённых полей (_try_expand_select_star →
-  rbac.expand_select_star). Развёрнутый запрос повторно валидируется RBAC,
-  факт развёртывания пишется в audit.log (type=select_star_expanded).
-- Полный список полей таблицы (для excluded_columns) подгружается асинхронно
-  заранее через rbac.extract_tables + db_manager.get_table_schema, потому что
-  expand_select_star синхронный.
-- Сообщения отказа по SELECT * теперь перечисляют разрешённые поля — LLM
-  видит, что нужно переписать, а не просто «запрещено».
-
-Ключевые изменения версии 261029.23:
-- Удалён инструмент execute_template: он работал только для MySQL и создавал
-  путаницу (модель пыталась использовать шаблоны на других диалектах).
-  Убрано из TOOLS_DEFINITION, из цикла tool_calls в process_message (вместе
-  с «белым списком» инструментов) и из системного промпта. Метод
-  _run_yaml_template удалён. config/templates.yaml оставлен на будущее, но
-  больше не используется.
-
-Ключевые изменения версии 261029.22:
-- Подпись кнопки удаления содержит сам текст факта: «❌ N. <текст>»
-  (текст схлопывается в одну строку и обрезается до 30 символов).
-  callback_data по-прежнему mem_del_<md5[:8]> — привязка к содержимому,
-  а не к индексу.
-- Кнопка изменения стала компактной «✏️ N» (mem_edit_<md5[:8]>).
-- Добавлен хелпер _memory_button_label() — единая подготовка подписи
-  факта для кнопок (защита от лимита Telegram в 64 символа на кнопку).
-
-Ключевые изменения версии 261029.21:
-- Callback'и памяти привязаны к содержимому факта, а не к индексу:
-  mem_edit_<hash> / mem_del_<hash>, где hash — первые 8 символов md5
-  текста факта. Индекс «плыл» после удаления/добавления, и кнопка
-  могла изменить не тот факт.
-- memory_find_by_hash / memory_delete_by_hash / memory_update_by_hash:
-  операции по хэшу; если факт уже удалён/изменён — возвращают None/False,
-  адаптер отвечает «Факт уже удалён или изменён».
-
-Ключевые изменения версии 261029.20:
-- Долгосрочная память стала интерактивной: /memory возвращает ChatResponse
-  с reply_markup (dict {"inline_keyboard": [...]}) — кнопки на каждый факт
-  (✏️ Изменить N, ❌ Удалить N) и общие (➕ Добавить, 🗑 Очистить всё).
-- Публичные методы render_memory / memory_add / memory_update / memory_delete /
-  memory_clear / memory_get — единая точка изменения памяти для адаптеров
-  (адаптер не лезет в SessionState напрямую).
-- _load_memory: факты подгружаются из Redis при первом обращении, поэтому
-  кнопки работают и в callback-хэндлерах (без вызова process_message).
-
-Ключевые изменения версии 261029.19:
-- _build_base_prompt: в "ПРАВИЛА АНАЛИЗА" добавлен пункт об обязательном
-  учёте долгосрочной памяти как постоянного фильтра SQL.
-- Статусы (status_callback) очищаются от HTML-тегов: Telegram не принимает
-  произвольные теги ("Unsupported start tag"), статусы всегда plain text.
-
-Ключевые изменения версии 261029.18:
-- Долгосрочная память пользователя: state.long_term_facts загружается из
-  Redis (repdix:memory:{user_id}, TTL 30 дней) и добавляется в системный
-  промпт блоком "Долгосрочная память пользователя".
-- Новые команды: /remember <текст>, /memory, /forget <номер>, /reset
-  (история + память + last_sqls). /clear очищает только историю —
-  память сохраняется.
-- Хелпер _save_memory() — единая точка записи памяти в Redis.
-
-Ключевые изменения версии 261029.16:
-- Динамическая схема БД: _get_db_schema(state, user_query) выводит поля
-  только для таблиц, упомянутых в вопросе / последних 4 сообщениях истории /
-  последних SQL. Если совпадений нет — в промпт идёт только список имён
-  таблиц (экономия контекста). Русские смысловые подсказки: "центр" -> centers,
-  "выручка" -> revenue и т.п.
-- Auto-Compact: при >60% лимита контекста первые 4 сообщения истории
-  сжимаются LLM в 2 предложения и заменяются одним system-сообщением.
-  Резюме дублируется в state.summary и сохраняется в Redis вместе с историей
-  (формат {"history": [...], "summary": "..."}; старый формат со списком
-  поддерживается при чтении).
-- В системный промпт добавлен блок "Последние выполненные SQL" (3 шт.):
-  модель может переиспользовать запрос для другого периода.
-
-Ключевые изменения версии 261029.15:
-- Статусы (status_callback) отдаются с HTML-разметкой модели: убрана обрезка
-  через _shorten_text (она могла разорвать <b>...</b> и порождала
-  "Can't parse entities" в Telegram). Вместо обрезки — нормализация
-  пробелов в одну строку, теги при этом не затрагиваются.
-
-Ключевые изменения версии 261029.14:
-- В промпт добавлен отдельный блок "ПРАВИЛА SQL": имена таблиц, колонок и
-  алиасов в MySQL обязательно оборачиваются в обратные кавычки (`) — защита
-  от зарезервированных слов (order, group, interval, key) и спецсимволов.
-
-Ключевые изменения версии 261029.13:
-- Правило об источниках цифр переформулировано: имена таблиц и полей
-  упоминаются ТОЛЬКО в сложных аналитических ответах ("почему", "как дела",
-  "проанализируй", "когда получим"). Для простых запросов (топ-N, список,
-  сколько записей) ответ содержит только данные, без SQL-схемы.
-- В "ПРАВИЛА ВЫВОДА" добавлен прямой запрет упоминать имена таблиц/полей
-  в обычных ответах (исключение — пользователь сам спросил про источник).
-
-Ключевые изменения версии 261029.12:
-- В "ПРАВИЛА ВЫВОДА" добавлено требование форматировать ответ в HTML
-  (<b> для ключевых цифр, <code> для имён таблиц/полей) и прямой запрет
-  Markdown (**жирный**, *курсив*, `код`): Telegram не рендерит его без
-  parse_mode, а с parse_mode ломается на подчёркиваниях в именах таблиц.
-- Пример выделения ключевых цифр переведён с Markdown на <b>, чтобы не
-  противоречить новому правилу.
-
-Ключевые изменения версии 261029.11:
-- Удалена вторая модель (deep_analysis_model / analysis_model): остаётся
-  только tool_calling_model. _route_query всегда возвращает выбранную
-  пользователем модель или tool_model. Удалены блок "analysis_model: без tools"
-  в process_message, константа ANALYSIS_MARKERS и упоминание в /settings.
-
-Ключевые изменения версии 261029.10:
-- Расширены "ПРАВИЛА АНАЛИЗА" (сравнение с предыдущим периодом, поиск
-  узкого места, указание источника цифр, предупреждение об устаревших
-  данных) и "ПРАВИЛА ВЫВОДА" (блок "Что делать", выделение ключевых
-  цифр, структурные разделы, запрет воды). Структура промпта не менялась.
-
-Ключевые изменения версии 261029.09:
-- Автоматический LIMIT больше не добавляется, если SQL содержит GROUP BY
-  или агрегатную функцию (COUNT/SUM/MIN/MAX/AVG): лимит для агрегатов
-  бессмыслен и только засорял лог.
-
-Ключевые изменения версии 261029.06:
-- Multi-schema: _get_db_schema() фильтрует схемы через
-  rbac.get_allowed_schemas(), таблицы — через rbac.get_allowed_tables();
-  таблицы выводятся fully-qualified (schema.table).
-- _describe_table() принимает schema и table раздельно.
-- _extract_table_from_sql() возвращает (schema, table).
-- _format_sql_result() принимает schema= (для корректного get_table_schema).
-- _extract_last_table_from_history() возвращает "schema.table", если схема
-  была указана в SQL.
-- /db, /db <name>, /settings показывают описания БД (get_db_display_name),
-  доступные схемы (с учётом RBAC) и схему по умолчанию.
-- _build_base_prompt(db_type, schemas, default_schema) — в промпт добавлен
-  список доступных схем и требование указывать схему перед таблицей.
-
-Ключевые изменения версии 261027.02:
-- Убран get_table_schema из инструментов и промпта (см. README: "Не возвращайте!").
-- Единый список TOOLS: execute_sql + get_relations + execute_template.
-- base_prompt переписан: убраны дубли, противоречия, упоминания несуществующих
-  инструментов, добавлена параметризация по типу БД (MySQL/PostgreSQL/SQLite).
-- RBAC теперь вызывается через validate_sql (алиас validate_and_fix_sql удалён
-  из engine, но оставлен в rbac_guard для обратной совместимости).
-- _run_yaml_template прогоняет собранный SQL через RBAC-гард (закрыта дыра:
-  шаблон мог обратиться к недоступной таблице).
-- _extract_last_table_from_history ищет таблицу в [executed_sql] или после FROM,
-  а не первое попавшееся слово.
-- _get_db_schema для админа показывает и поля (как для обычных пользователей),
-  а не только список таблиц.
-- _route_query: длинный вопрос (len>200) больше НЕ отправляется в analysis_model
-  без tools. analysis_model выбирается только по явным аналитическим маркерам.
-- Жёсткая обрезка ответа (2000) заменена на self.max_message_length.
-- Удалён мёртвый код _should_force_tool, _get_default_schema (дублировал логику).
-- _format_sql_result больше не выводит Markdown-таблицы (противоречило промпту).
-- _log_sql_audit различает ручной (/sql) и LLM-инициированный SQL.
-- _save_history больше не засоряет историю system-сообщениями [executed_sql]
-  (они копятся отдельно в state.last_sqls и НЕ обрезаются вместе с историей).
-- Мелочи: единый time_markers, нормализация default_schema, try/except вокруг
-  get_table_list, context overflow — обрезка по парам user/assistant.
-"""
+dv_file_version = '261030.06'
+"""Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
 import hashlib
@@ -210,6 +18,8 @@ from app.core.session import SessionState, SessionStore
 from app.core.technical_filter import is_technical, is_technical_qualified
 from app.core.validator import log_violation, strip_sql_comments, validate_sql
 from app.core.rbac_guard import RBACGuard
+from app.core.sql_complexity import SQLTooComplex, check_complexity
+from app.core.manual_sql_audit import log_manual_sql
 from app.interfaces.base import ChatMessage, ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -443,6 +253,11 @@ class RepdixEngine:
                 os.environ.get("AGENT_MAX_STEPS"),
             )
             self.agent_max_steps = 10
+        # Пороги проверки сложности SQL (см. app/core/sql_complexity.py).
+        # Читаются один раз при старте: нечисловые значения дают fallback.
+        self.sql_max_joins = self._env_int("SQL_MAX_JOINS", 5)
+        self.sql_max_depth = self._env_int("SQL_MAX_SUBQUERY_DEPTH", 3)
+        self.sql_max_unions = self._env_int("SQL_MAX_UNIONS", 3)
 
     # ---------- Динамическая схема: настройки ----------
     # Сколько последних сообщений истории учитывать при поиске таблиц
@@ -466,6 +281,24 @@ class RepdixEngine:
     }
 
     # ---------- Хелперы ----------
+    @staticmethod
+    def _env_int(name: str, default: int, minimum: int = 0) -> int:
+        """Читает целочисленную настройку из env с безопасным fallback.
+
+        Нечисловое значение не должно ронять инициализацию — пишем WARNING
+        и возвращаем default.
+        """
+        raw = os.environ.get(name)
+        if raw is None or not str(raw).strip():
+            return default
+        try:
+            return max(minimum, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение %s=%r, использую %d", name, raw, default,
+            )
+            return default
+
     def _get_default_schema(self, state: SessionState) -> str:
         """Возвращает имя схемы по умолчанию для текущей БД.
 
@@ -1620,6 +1453,13 @@ class RepdixEngine:
                         schema=schema_part, table_name=table_part,
                     )
                     self._log_sql_audit(audit_sql, duration, "success", source="manual")
+                    log_manual_sql(
+                        user_id=user_id,
+                        db_name=state.current_db,
+                        sql=audit_sql,
+                        duration_ms=duration * 1000,
+                        rows_returned=len(rows),
+                    )
                     if self.show_model_in_response:
                         audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
                     self._log_audit(state, msg, audit_question, audit_answer)
@@ -1628,6 +1468,13 @@ class RepdixEngine:
                     duration = time.perf_counter() - start_time
                     err_str = str(e)
                     self._log_sql_audit(audit_sql, duration, "error", err_str, source="manual")
+                    log_manual_sql(
+                        user_id=user_id,
+                        db_name=state.current_db,
+                        sql=audit_sql,
+                        duration_ms=duration * 1000,
+                        error=err_str,
+                    )
                     if "timeout" in err_str.lower() or "MAX_EXECUTION_TIME" in err_str:
                         timeout_val = os.environ.get('SQL_QUERY_TIMEOUT', '15')
                         audit_answer = f"Запрос выполнялся слишком долго (лимит {timeout_val} сек) и был прерван."
@@ -2031,6 +1878,39 @@ class RepdixEngine:
                                 "role": "tool",
                                 "tool_call_id": tool_call["id"],
                                 "content": "Ошибка: БД не выбрана",
+                            })
+                            continue
+
+                        # Проверка сложности SQL — ПОСЛЕ RBAC и ДО выполнения.
+                        # Отказ уходит модели как tool-сообщение (как и ошибки
+                        # validate_sql): она может переформулировать запрос,
+                        # пользователю ошибка не отправляется.
+                        try:
+                            check_complexity(
+                                sql,
+                                dialect=db_type,
+                                max_joins=self.sql_max_joins,
+                                max_depth=self.sql_max_depth,
+                                max_unions=self.sql_max_unions,
+                            )
+                        except SQLTooComplex as e:
+                            logger.warning(
+                                "SQL rejected by complexity check",
+                                extra={
+                                    "user_id": user_id,
+                                    "reason": e.reason,
+                                    "sql": sql[:500],
+                                    "dialect": db_type,
+                                },
+                            )
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call["id"],
+                                "content": (
+                                    f"Ошибка: {e.reason} "
+                                    "Переформулируй запрос проще или попроси "
+                                    "пользователя уточнить вопрос."
+                                ),
                             })
                             continue
 

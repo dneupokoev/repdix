@@ -12,6 +12,7 @@
 - подстановка `${VAR}` из переменных окружения;
 - выбор клиента и модели по имени;
 - хранение лимитов контекста;
+- чтение параметров модели: `base_url`, `api_key`, `model_name`, `supports_tools`, `temperature`, `max_tokens`, `context_length`;
 - выполнение `chat`-запросов с поддержкой `temperature`, `max_tokens`, `tools`, `tool_choice`, `response_format`;
 - retry-fallback, если провайдер не поддерживает `tool_choice` или `tools`;
 - корректное закрытие всех созданных клиентов.
@@ -75,7 +76,7 @@
 Аргумент:
 - `model_name` — имя модели; если не передано, используется `default_model`.
 
-Если значение не найдено, возвращается `_DEFAULT_CONTEXT_LENGTH`, которое берётся из env `DEFAULT_CONTEXT_LENGTH` или равно `32768`.
+Если значение не найдено, возвращается `_DEFAULT_CONTEXT_LENGTH`, которое берётся из env `DEFAULT_CONTEXT_LENGTH` или равно `32768`. Значение `_DEFAULT_CONTEXT_LENGTH` вычисляется при импорте модуля.
 
 ### `_get_model_conf(name: str) -> dict`
 
@@ -178,7 +179,7 @@ Fallback-retry:
 
 ## Особенности и ограничения
 
-- Hot-reload выполняется по mtime; при неизменном mtime конфиг не перечитывается, если не передан `force=True`.
+- Hot-reload выполняется по mtime; при неизменном mtime конфг не перечитывается, если не передан `force=True`.
 - `_clients_meta` фактически отслеживает `base_url` и `api_key`; `temperature` читается при каждом `chat()` и не требует пересоздания клиента. Комментарий в шапке файла упоминает `temperature` в `_clients_meta`, но фактическое сравнение метаданных учитывает только `base_url` и `api_key`.
 - При отсутствии `${VAR}` в окружении подставляется пустая строка с warning.
 - `supports_tools=False` означает, что переданные `tools` будут проигнорированы с предупреждением.
