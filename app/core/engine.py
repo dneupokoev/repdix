@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261030.11'
+dv_file_version = '261030.13'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -997,6 +997,25 @@ class RepdixEngine:
             audit_question = text
             audit_answer = ""
 
+            # Проверка активности — кроме /start и /help (нужны для регистрации).
+            # Раньше сервисные команды (/db, /model, /settings, /sql, /remember)
+            # пропускались мимо is_user_active в handle_message — заблокированный
+            # пользователь с сохранёнными ролями мог выполнить /sql через RBAC,
+            # а неодобренный — увидеть /settings (утечка метаданных) или
+            # засорить Redis через /remember.
+            if (
+                self.user_manager
+                and text not in ("/start", "/help")
+                and not text.startswith("/help ")
+            ):
+                if (
+                    not self.user_manager.is_admin(user_id)
+                    and not self.user_manager.is_user_active(user_id)
+                ):
+                    return ChatResponse(
+                        text="⏳ Ваша заявка на рассмотрении у администратора."
+                    )
+
             # ---------- /help ----------
             if text == "/help":
                 state.last_model_used = "algorithm (command)"
@@ -1426,6 +1445,27 @@ class RepdixEngine:
             if text.startswith("/sql "):
                 state.last_model_used = "algorithm (command)"
                 sql = text[5:].strip()
+
+                # /sql — только для активных пользователей с ролью sql_executor
+                # (или админов). Роль sql_executor не даёт доступа к таблицам —
+                # только право на /sql; RBAC проверяет таблицы по остальным ролям.
+                if self.user_manager:
+                    user_roles_check = self.user_manager.get_user_roles(user_id) or []
+                    is_admin_user = self.user_manager.is_admin(user_id)
+                    if not is_admin_user and "sql_executor" not in user_roles_check:
+                        log_violation(
+                            user_id or "unknown", sql,
+                            "/sql без роли sql_executor",
+                        )
+                        audit_answer = (
+                            "⛔ Команда /sql доступна только пользователям с ролью "
+                            "sql_executor. Обратитесь к администратору."
+                        )
+                        if self.show_model_in_response:
+                            audit_answer += f"\n\n_Ответ от модели: {state.last_model_used}_"
+                        self._log_audit(state, msg, audit_question, audit_answer)
+                        return ChatResponse(text=audit_answer)
+
                 is_valid, reason = validate_sql(sql)
 
                 if not is_valid:

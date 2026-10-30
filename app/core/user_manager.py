@@ -1,5 +1,5 @@
 # app/core/user_manager.py
-dv_file_version = '261030.06'
+dv_file_version = '261030.07'
 """Управление пользователями repdix через config/users.yaml"""
 
 import asyncio
@@ -393,6 +393,10 @@ class UserManager:
                 return False
 
             users[uid]["is_active"] = False
+            # Блокировка = отзыв доступа. Иначе заблокированный пользователь
+            # с сохранёнными ролями (включая sql_executor) продолжит иметь
+            # доступ к /sql, если is_active не проверяется для сервисных команд.
+            users[uid]["roles"] = []
             return self._save_users_yaml(users)
 
     async def delete_user(self, user_id: str) -> bool:
@@ -530,6 +534,10 @@ class UserManager:
                 return False, False
             new_active = not bool(users[uid].get("is_active", False))
             users[uid]["is_active"] = new_active
+            if not new_active:
+                # Блокировка отзывает роли. Разблокировка не восстанавливает
+                # их автоматически — админ назначает заново (осознанно).
+                users[uid]["roles"] = []
             ok = self._save_users_yaml(users)
             return ok, new_active
 
