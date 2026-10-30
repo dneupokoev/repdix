@@ -1,5 +1,5 @@
 # app/core/rbac_guard.py
-dv_file_version = '261030.03'
+dv_file_version = '261030.05'
 """RBAC-гард: проверка SQL на соответствие ролям пользователя.
 
 Ключевые принципы:
@@ -432,10 +432,14 @@ class RBACGuard:
         # Если у таблицы есть excluded_columns и разрешена звёздочка —
         # SELECT * утёк бы исключёнными полями. Запрещаем.
         for star in parsed.find_all(exp.Star):
+            # COUNT(*) — агрегат, не возвращает поля. Не блокируем.
+            parent = star.parent
+            if isinstance(parent, exp.Count):
+                continue
+
             # Определяем, к какой таблице относится звёздочка.
             # exp.Star может быть в SELECT * (без квалификатора) или в t.*.
             # sqlglot: t.* — это Column(this=Star, table=Identifier).
-            parent = star.parent
             target_rule = None
             target_name = ""
 
@@ -481,11 +485,8 @@ class RBACGuard:
 
             if target_rule is None:
                 # Колонка без квалификатора. Если в запросе одна таблица —
-                # логично отнести её к ней. Если несколько — проверяем по
-                # всем: колонка должна быть разрешена хотя бы в одной.
-                # Но для безопасности требуем, чтобы она была разрешена
-                # во ВСЕХ таблицах, где она потенциально может быть
-                # (иначе можно обойти через одноимённое поле).
+                # логично отнести её к ней. Если несколько — колонка
+                # неоднозначна, требуем разрешение ВО ВСЕХ таблицах запроса.
                 candidates = []
                 seen = set()
                 for q, r in table_rule_map.items():
@@ -497,8 +498,7 @@ class RBACGuard:
                 if not candidates:
                     return False, f"Не удалось определить таблицу для поля '{col_name}'."
 
-                # Проверяем: колонка должна быть разрешена хотя бы в одной
-                # таблице запроса. Если она excluded в любой — запрещаем.
+                # Если колонка excluded хотя бы в одной таблице — запрещаем.
                 for r in candidates:
                     if col_name in r["excluded"]:
                         return (
@@ -506,15 +506,19 @@ class RBACGuard:
                             f"Доступ к полю '{col_name}' запрещен (скрытое поле).",
                         )
 
-                allowed_anywhere = any(
+                # Колонка без квалификатора при нескольких таблицах неоднозначна:
+                # SELECT secret_col FROM t1 JOIN t2 может вернуть значение из t2,
+                # даже если t1 разрешает secret_col. Требуем, чтобы колонка была
+                # разрешена ВО ВСЕХ таблицах запроса (или имела wildcard).
+                allowed_everywhere = all(
                     r["has_wildcard"] or col_name in r["allowed"]
                     for r in candidates
                 )
-                if not allowed_anywhere:
+                if not allowed_everywhere:
                     return (
                         False,
-                        f"Доступ к полю '{col_name}' запрещен "
-                        f"(нет в allowed_columns).",
+                        f"Доступ к полю '{col_name}' запрещен: при нескольких таблицах "
+                        f"колонка должна быть разрешена во всех (или квалифицируй её).",
                     )
                 continue
 

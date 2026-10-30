@@ -1,5 +1,5 @@
 # app/core/llm_client.py
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 """Клиент для работы с LLM через OpenAI-совместимый API."""
 
 import asyncio
@@ -38,6 +38,9 @@ class LLMClient:
         # Метаданные клиентов: чтобы при hot-reload пересоздавать только
         # те, у которых изменились base_url/api_key/temperature.
         self._clients_meta: dict[str, dict] = {}
+        # Клиенты, которые не удалось закрыть сразу (не было event loop
+        # в момент пересоздания). Закрываются в close().
+        self._orphaned_clients: list[AsyncOpenAI] = []
         self._context_lengths: dict[str, int] = {}
         self._mtime: float = 0.0
         self.load_config()
@@ -229,7 +232,11 @@ class LLMClient:
                     loop = asyncio.get_running_loop()
                     loop.create_task(existing.close())
                 except RuntimeError:
-                    pass  # нет event loop (тесты, CLI) — GC закроет
+                    logger.warning(
+                        "Модель %s: event loop закрыт, старый клиент будет "
+                        "закрыт при close() LLMClient.", name,
+                    )
+                    self._orphaned_clients.append(existing)
             self.clients[name] = self._make_client(name, model_conf)
             self._clients_meta[name] = meta
 
@@ -360,15 +367,22 @@ class LLMClient:
     # Закрытие
     # ------------------------------------------------------------------
     async def close(self) -> None:
-        """Закрывает все клиенты AsyncOpenAI.
+        """Закрывает все клиенты AsyncOpenAI, включая orphaned.
 
         Ошибка закрытия одного клиента не блокирует закрытие остальных.
         """
         clients = list(self.clients.values())
+        orphaned = list(self._orphaned_clients)
         self.clients.clear()
         self._clients_meta.clear()
+        self._orphaned_clients.clear()
         for client in clients:
             try:
                 await client.close()
             except Exception as e:
                 logger.warning("Ошибка закрытия LLM-клиента: %s", e)
+        for client in orphaned:
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning("Ошибка закрытия orphaned LLM-клиента: %s", e)

@@ -1,14 +1,16 @@
-"""Тесты фиксации неудачного развёртывания SELECT * в audit.log.
+"""Тесты поведения _try_expand_select_star().
 
-Если авторазвёртывание SELECT * в явный список полей не удалось, попытка
-обойти ограничение RBAC должна оставлять след — вызов log_violation.
-Проверяются три ветки _try_expand_select_star(): неудача развёртывания,
-отказ повторной RBAC-валидации, успех.
+Неудача авторазвёртывания SELECT * — не нарушение безопасности:
+пишем в audit.log (type=expand_select_star_failed), а не в security.log.
+Отказ повторной RBAC-валидации — реальный инцидент (log_violation).
+Проверяются три ветки: неудача развёртывания, отказ RBAC, успех.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,22 +24,36 @@ def _make_engine() -> RepdixEngine:
             return RepdixEngine()
 
 
-def test_expand_failure_logs_violation() -> None:
-    """db_manager=None — развернуть нельзя, пишем violation и возвращаем None."""
+def test_expand_failure_logs_audit_not_security(caplog) -> None:
+    """db_manager=None — развернуть нельзя: audit.log, НЕ security.log."""
     engine = _make_engine()
     state = SimpleNamespace(user_id="user-1", current_db=None)
 
-    with patch("app.core.engine.log_violation") as log_mock:
-        result = asyncio.run(
-            engine._try_expand_select_star(
-                "SELECT * FROM t", state, ["user"], "public", source="llm",
+    with caplog.at_level(logging.INFO, logger="audit"):
+        with patch("app.core.engine.log_violation") as log_mock:
+            result = asyncio.run(
+                engine._try_expand_select_star(
+                    "SELECT * FROM t", state, ["user"], "public",
+                    source="llm",
+                )
             )
-        )
 
     assert result is None
-    log_mock.assert_called_once_with(
-        "user-1", "SELECT * FROM t", "expand_select_star failed",
-    )
+    log_mock.assert_not_called()
+
+    records = [
+        json.loads(r.message) for r in caplog.records
+        if r.name == "audit"
+    ]
+    failures = [
+        r for r in records if r.get("type") == "expand_select_star_failed"
+    ]
+    assert len(failures) == 1
+    event = failures[0]
+    assert event["user_id"] == "user-1"
+    assert event["source"] == "llm"
+    assert event["sql"] == "SELECT * FROM t"
+    assert "timestamp" in event
 
 
 def test_expand_rejected_by_rbac_logs_violation() -> None:

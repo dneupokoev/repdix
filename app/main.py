@@ -1,5 +1,5 @@
 # app/main.py
-dv_file_version = '261028.10'
+dv_file_version = '261030.02'
 """Точка входа repdix: выбор адаптера и запуск event loop"""
 
 import asyncio
@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Логирование
 # ----------------------------------------------------------------------
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Читает целое из env с fallback. Не роняет приложение."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(minimum, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Некорректное значение %s=%r, использую %d", name, raw, default,
+        )
+        return default
+
+
 def _setup_logging() -> None:
     """Настраивает основной лог, аудит и security-лог с ротацией."""
     # Основной лог (консоль)
@@ -49,8 +63,8 @@ def _setup_logging() -> None:
     audit_logger = logging.getLogger("audit")
     audit_logger.setLevel(logging.INFO)
     audit_logger.propagate = False  # не дублируем в консоль
-    log_max_bytes = int(os.environ.get("LOG_MAX_BYTES") or str(100 * 1024 * 1024))
-    log_backup_count = int(os.environ.get("LOG_BACKUP_COUNT") or "5")
+    log_max_bytes = _env_int("LOG_MAX_BYTES", 100 * 1024 * 1024)
+    log_backup_count = _env_int("LOG_BACKUP_COUNT", 5, minimum=0)
     audit_handler = RotatingFileHandler(
         'logs/audit.log',
         maxBytes=log_max_bytes,
@@ -67,8 +81,8 @@ def _setup_logging() -> None:
     security_logger = logging.getLogger("security")
     security_logger.setLevel(logging.INFO)
     security_logger.propagate = False
-    sec_max_bytes = int(os.environ.get("SECURITY_LOG_MAX_BYTES") or str(50 * 1024 * 1024))
-    sec_backup_count = int(os.environ.get("SECURITY_LOG_BACKUP_COUNT") or "5")
+    sec_max_bytes = _env_int("SECURITY_LOG_MAX_BYTES", 50 * 1024 * 1024)
+    sec_backup_count = _env_int("SECURITY_LOG_BACKUP_COUNT", 5, minimum=0)
     sec_handler = RotatingFileHandler(
         'logs/security.log',
         maxBytes=sec_max_bytes,
@@ -192,6 +206,9 @@ async def main() -> None:
         default_db=os.environ.get("DEFAULT_DB"),
         user_manager=user_manager,
     )
+    # Фоновая очистка TTL сессий (иначе при малом числе пользователей
+    # просроченные сессии живут до рестарта).
+    engine.sessions.start_cleanup_task()
 
     # --- Адаптер ---
     adapter = _build_adapter(engine)
@@ -217,6 +234,13 @@ async def main() -> None:
 
 async def _shutdown(engine: RepdixEngine, adapter) -> None:
     """Аккуратно закрывает все ресурсы. Не падает, если что-то уже закрыто."""
+    # 0. Останавливаем фоновую очистку (до clear_all), чтобы таск не
+    #    продолжал работать над уже освобождённым хранилищем.
+    try:
+        await engine.sessions.stop_cleanup_task()
+    except Exception as e:
+        logger.warning("Ошибка остановки cleanup-таска сессий: %s", e)
+
     # 1. Отменяем все висящие сессии/задачи пользователей
     try:
         engine.sessions.clear_all()

@@ -1,5 +1,5 @@
 # app/core/session.py
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 """Состояние сессии пользователя для repdix."""
 
 import asyncio
@@ -60,6 +60,9 @@ class SessionStore:
         # Счётчик обращений — чтобы cleanup() запускался не на каждый get()
         self._access_counter = 0
         self._cleanup_every = 100
+        # Фоновая очистка TTL (start_cleanup_task/stop_cleanup_task).
+        self._cleanup_task: asyncio.Task | None = None
+        self._cleanup_interval_sec = 300  # 5 минут
 
     # ------------------------------------------------------------------
     # Получение / создание
@@ -153,6 +156,47 @@ class SessionStore:
         if expired:
             logger.info("TTL: удалено %d просроченных сессий", len(expired))
         return len(expired)
+
+    # ------------------------------------------------------------------
+    # Фоновая очистка TTL
+    # ------------------------------------------------------------------
+    def start_cleanup_task(self) -> None:
+        """Запускает фоновую очистку просроченных сессий.
+
+        Идемпотентен: повторный вызов ничего не делает.
+        Вызывать из main.py после создания engine.
+        """
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        logger.info(
+            "SessionStore: фоновая очистка запущена (интервал %d сек)",
+            self._cleanup_interval_sec,
+        )
+
+    async def _cleanup_loop(self) -> None:
+        """Фоновая очистка TTL. Не падает при ошибках."""
+        try:
+            while True:
+                await asyncio.sleep(self._cleanup_interval_sec)
+                try:
+                    self._cleanup_expired(time.monotonic())
+                except Exception as e:
+                    logger.warning("SessionStore: ошибка cleanup: %s", e)
+        except asyncio.CancelledError:
+            logger.info("SessionStore: фоновая очистка остановлена")
+            raise
+
+    async def stop_cleanup_task(self) -> None:
+        """Останавливает фоновую очистку (для graceful shutdown)."""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            return
+        self._cleanup_task.cancel()
+        try:
+            await self._cleanup_task
+        except asyncio.CancelledError:
+            pass
+        self._cleanup_task = None
 
     # ------------------------------------------------------------------
     # Диагностика

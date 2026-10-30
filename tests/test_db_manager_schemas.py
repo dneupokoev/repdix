@@ -1,6 +1,7 @@
 """Тесты multi-schema поддержки DBManager (без реального подключения к БД)."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 from app.core.db_manager import DBManager
@@ -60,6 +61,29 @@ def test_get_schemas_auto():
         {"schema_name": "information_schema"},
     ])
     assert run(mgr.get_schemas("db")) == ["db_a", "db_b"]
+
+
+def test_get_schemas_auto_failure_returns_empty(tmp_path, caplog):
+    cfg = tmp_path / "databases.yaml"
+    cfg.write_text(
+        "databases:\n"
+        "  db:\n"
+        "    type: mysql\n"
+        "    database: db\n"
+        "    schemas: auto\n"
+        "    exclude_schemas: [mysql, information_schema]\n",
+        encoding="utf-8",
+    )
+    mgr = DBManager(config_path=str(cfg))
+    mgr.execute_query = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with caplog.at_level(logging.ERROR):
+        assert run(mgr.get_schemas("db")) == []
+        # Повторный вызов не должен отдавать закэшированный пустой список.
+        assert run(mgr.get_schemas("db")) == []
+
+    assert "возвращаю пустой список" in caplog.text
+    assert mgr.execute_query.await_count == 2
 
 
 # ---------------------------------------------------------------------------

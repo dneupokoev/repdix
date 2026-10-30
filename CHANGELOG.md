@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-10-30
+
+### Добавлено
+- session: фоновая очистка просроченных сессий (start_cleanup_task/stop_cleanup_task) + интеграция в main.py — app/core/session.py, app/main.py
+- tests: tests/test_session_cleanup.py — покрытие фоновой очистки TTL
+
+### Исправлено
+- _extract_table_from_sql переведён на sqlglot (кавычки, CTE, подзапросы) — app/core/engine.py
+- db_manager: get_schemas(auto) при сбое возвращает [] вместо fallback-схемы (LLM не получает ложную картину) — app/core/db_manager.py
+- rbac_guard: неквалифицированные колонки при нескольких таблицах проверяются по всем таблицам (было any, стало all) — app/core/rbac_guard.py
+- validator: DANGEROUS_PATTERNS ищутся только вне строковых литералов (ложные отказы на 'SET GLOBAL x') — app/core/validator.py
+- engine: неудача expand_select_star пишется в audit.log, а не в security.log — app/core/engine.py
+
 ## [2026-10-29]
 
 ### Добавлено

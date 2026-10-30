@@ -1,5 +1,5 @@
 # app/core/validator.py
-dv_file_version = '261030.01'
+dv_file_version = '261030.02'
 r"""Валидатор SQL-запросов: проверка безопасности."""
 
 import logging
@@ -132,6 +132,46 @@ def _strip_comments_for_check(sql: str) -> str:
         out.append(ch)
         i += 1
 
+    return "".join(out)
+
+
+def _strip_string_literals(sql: str) -> str:
+    """Заменяет содержимое строковых литералов на пробелы.
+
+    Нужна для проверки DANGEROUS_PATTERNS: паттерн внутри литерала
+    ('SET GLOBAL x') не должен блокировать запрос. Кавычки сохраняются,
+    чтобы структура не ломалась; содержимое — пробелы.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(sql)
+    quote: str | None = None
+    while i < n:
+        ch = sql[i]
+        if quote is not None:
+            if ch == "\\" and i + 1 < n:
+                out.append("  ")
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    out.append("  ")
+                    i += 2
+                    continue
+                quote = None
+                out.append(ch)
+                i += 1
+                continue
+            out.append(" ")
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
     return "".join(out)
 
 
@@ -276,9 +316,11 @@ def validate_sql(sql: str) -> tuple[bool, str]:
         if re.search(pattern, check_upper):
             return False, f"forbidden keyword: {keyword}"
 
-    # Опасные паттерны
+    # Опасные паттерны — только вне строковых литералов.
+    # Иначе SELECT 'SET GLOBAL x' ложно блокируется.
+    patterns_text = _strip_string_literals(check_sql).upper()
     for pat in DANGEROUS_PATTERNS:
-        if re.search(pat, check_upper):
+        if re.search(pat, patterns_text):
             return False, f"forbidden pattern: {pat}"
 
     return True, ""

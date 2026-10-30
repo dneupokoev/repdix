@@ -97,6 +97,68 @@ def sanitize_telegram_html(text: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# Нарезка длинных сообщений
+# ----------------------------------------------------------------------
+# Ограничение Telegram на длину одного сообщения (берём с запасом).
+MAX_MESSAGE_LENGTH = 4000
+
+
+def _split_long_text(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Режет текст на части длиной не более max_length.
+
+    Приоритет точек разреза: перевод строки → пробел → жёсткая нарезка.
+    Разрез не попадает внутрь HTML-тега ``<...>``: если граница оказалась
+    между ``<`` и ``>``, она сдвигается к началу тега (иначе Telegram
+    отклонит разметку этой части).
+
+    Args:
+        text: Исходный текст (может содержать HTML-разметку).
+        max_length: Максимальная длина одной части в символах.
+
+    Returns:
+        Список непустых частей. Для короткого текста — ``[text]``.
+    """
+    if max_length <= 0:
+        raise ValueError("max_length должен быть положительным")
+    if len(text) <= max_length:
+        return [text]
+
+    parts: list[str] = []
+    remaining = text
+
+    while len(remaining) > max_length:
+        # 1. Мягкая граница: сначала перевод строки, затем пробел.
+        split_idx = remaining.rfind("\n", 0, max_length)
+        if split_idx <= 0:
+            split_idx = remaining.rfind(" ", 0, max_length)
+        if split_idx <= 0:
+            # 2. Жёсткая нарезка: подходящих пробелов нет.
+            split_idx = max_length
+
+        # 3. Не разрываем HTML-тег.
+        candidate = split_idx
+        lt_pos = remaining.rfind("<", 0, split_idx)
+        if lt_pos != -1:
+            gt_pos = remaining.find(">", lt_pos)
+            if gt_pos == -1 or gt_pos >= split_idx:
+                candidate = lt_pos
+                while candidate > 0 and remaining[candidate - 1] in " \n\t\r":
+                    candidate -= 1
+                if candidate <= 0:
+                    # Тег начинается с первого символа — режем жёстко.
+                    candidate = split_idx
+
+        parts.append(remaining[:candidate])
+        remaining = remaining[candidate:].lstrip()
+        if not remaining:
+            break
+
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+# ----------------------------------------------------------------------
 # Константы
 # ----------------------------------------------------------------------
 # Служебные команды, которые НЕ должны перехватываться регистрацией.
@@ -1702,21 +1764,7 @@ class TelegramAdapter(BaseChatInterface):
 
     async def _send_long_message(self, message: types.Message, text: str,
                                   reply_markup=None) -> None:
-        max_length = 4000
-        if len(text) <= max_length:
-            await self._answer_html(message, text, reply_markup=reply_markup)
-            return
-
-        parts: list[str] = []
-        while len(text) > max_length:
-            split_idx = text.rfind('\n', 0, max_length)
-            if split_idx == -1:
-                split_idx = max_length
-            parts.append(text[:split_idx])
-            text = text[split_idx:].lstrip()
-
-        if text:
-            parts.append(text)
+        parts = _split_long_text(text, MAX_MESSAGE_LENGTH)
 
         for i, part in enumerate(parts):
             is_last = i == len(parts) - 1

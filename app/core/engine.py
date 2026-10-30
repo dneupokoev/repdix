@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261030.06'
+dv_file_version = '261030.08'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -12,7 +12,9 @@ import re
 import time
 from datetime import datetime
 
+import sqlglot
 import yaml
+from sqlglot import exp
 
 from app.core.session import SessionState, SessionStore
 from app.core.technical_filter import is_technical, is_technical_qualified
@@ -411,20 +413,44 @@ class RepdixEngine:
         return result_text
 
     def _extract_table_from_sql(self, sql: str) -> tuple[str | None, str] | None:
-        """Извлекает (schema, table) из первого FROM-выражения.
+        """Извлекает (schema, table) из первого FROM-выражения через sqlglot.
 
-        Returns:
-            (schema, table) или None, если таблица не найдена. schema=None,
-            если в SQL схема не указана.
+        В отличие от regex-версии, корректно обрабатывает обратные кавычки,
+        CTE (берётся реальная таблица из CTE, а не имя CTE) и подзапросы
+        (приоритет — таблица из внешнего SELECT, затем любая).
         """
-        match = re.search(r'\bFROM\s+([a-zA-Z0-9_\.]+)', sql, re.IGNORECASE)
-        if not match:
+        if not sql:
             return None
-        raw = match.group(1)
-        if "." in raw:
-            schema, table = raw.split(".", 1)
-            return (schema or None), table
-        return None, raw
+        try:
+            parsed = sqlglot.parse_one(sql, read="mysql")
+        except Exception:
+            return None
+        if parsed is None:
+            return None
+
+        cte_names: set[str] = set()
+        for cte in parsed.find_all(exp.CTE):
+            alias = cte.alias_or_name
+            if alias:
+                cte_names.add(alias.lower())
+
+        outer_tables: list[exp.Table] = []
+        for select in parsed.find_all(exp.Select):
+            outer_tables.extend(self._direct_tables(select))
+
+        for table in outer_tables + list(parsed.find_all(exp.Table)):
+            name = (table.name or "").lower()
+            if not name or name in cte_names:
+                continue
+            raw_db = table.db
+            if isinstance(raw_db, exp.Identifier):
+                schema = (raw_db.name or "").lower()
+            elif isinstance(raw_db, str):
+                schema = raw_db.lower()
+            else:
+                schema = ""
+            return (schema or None), name
+        return None
 
     @staticmethod
     def _split_qualified(name: str, default_schema: str = "") -> tuple[str, str]:
@@ -434,6 +460,18 @@ class RepdixEngine:
             schema, table = raw.split(".", 1)
             return schema.lower(), table
         return (default_schema or "").lower(), raw
+
+    @staticmethod
+    def _direct_tables(select: exp.Select) -> list[exp.Table]:
+        """Таблицы из FROM/JOIN конкретного SELECT (без подзапросов)."""
+        result: list[exp.Table] = []
+        from_clause = select.args.get("from") or select.args.get("from_")
+        if from_clause is not None and isinstance(from_clause.this, exp.Table):
+            result.append(from_clause.this)
+        for join in select.args.get("joins") or []:
+            if isinstance(join.this, exp.Table):
+                result.append(join.this)
+        return result
 
     # ---------- Роутинг моделей ----------
     def _route_query(self, text: str, state: SessionState) -> str:
@@ -2393,14 +2431,16 @@ class RepdixEngine:
             sql, state, user_roles, default_schema,
         )
         if not expanded:
-            # Неудача развёртывания — отдельное событие безопасности:
-            # попытка обойти ограничение на SELECT * должна оставлять след.
-            # Длину/SQL-санитайзинг выполняет сам log_violation.
-            log_violation(
-                user_id_for_log,
-                sql,
-                "expand_select_star failed",
-            )
+            # Это не нарушение безопасности, а неудачная попытка «починить»
+            # SELECT *. Пишем в audit.log, не в security.log, чтобы не
+            # засорять security-лог ложными срабатываниями.
+            audit_logger.info(json.dumps({
+                "timestamp": datetime.now().isoformat(),
+                "type": "expand_select_star_failed",
+                "user_id": user_id_for_log,
+                "source": source,
+                "sql": (sql or "")[:1000],
+            }, ensure_ascii=False))
             return None
 
         ok, message = self.rbac.validate_sql(

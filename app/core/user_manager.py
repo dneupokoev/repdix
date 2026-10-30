@@ -1,5 +1,5 @@
 # app/core/user_manager.py
-dv_file_version = '261028.05'
+dv_file_version = '261030.06'
 """Управление пользователями repdix через config/users.yaml"""
 
 import asyncio
@@ -248,6 +248,11 @@ class UserManager:
                     default_flow_style=False,
                     sort_keys=False,
                 )
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except OSError as e:
+                    logger.warning("fsync users.yaml не удался: %s", e)
 
             os.replace(tmp_path, self.users_yaml_path)
 

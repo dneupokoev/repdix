@@ -1,5 +1,5 @@
 # app/core/db_manager.py
-dv_file_version = '261030.02'
+dv_file_version = '261030.05'
 """Менеджер подключений к базам данных (MySQL / PostgreSQL / SQLite)."""
 
 import asyncio
@@ -16,6 +16,7 @@ import yaml
 from pymysql.constants import CLIENT
 
 from app.core.technical_filter import is_technical
+from app.core.validator import _strip_string_literals
 
 logger = logging.getLogger(__name__)
 
@@ -226,10 +227,15 @@ class DBManager:
                     self._cache_set(cache_key, names)
                     return names
                 except Exception as e:
-                    logger.warning(
-                        "get_schemas(auto) failed for %s: %s", db_name, e
+                    # Не подменяем список одной схемой: LLM получит ложную
+                    # картину и сгенерирует SQL по несуществующей таблице.
+                    # Пустой список — явный сигнал «схемы недоступны»;
+                    # engine._get_db_schema вернёт "" и LLM увидит "—".
+                    logger.error(
+                        "get_schemas(auto) failed for %s: %s — возвращаю пустой список",
+                        db_name, e,
                     )
-                    return _fallback()
+                    return []
             # postgresql/sqlite: auto вне текущей задачи
             result = _fallback()
             self._cache_set(cache_key, result)
@@ -292,6 +298,14 @@ class DBManager:
                     str(stmt).strip() for stmt in init_statements_conf
                     if str(stmt).strip()
                 ]
+                for stmt in init_stmts:
+                    stripped = _strip_string_literals(stmt)
+                    if ";" in stripped:
+                        logger.warning(
+                            "DB %s: init_statements содержит ';' вне литералов "
+                            "(stmt=%r). CLIENT.MULTI_STATEMENTS разорвёт команду.",
+                            name, stmt,
+                        )
             else:
                 # Автогенерируемые SET-запросы.
                 # readonly → запрет записи на уровне сессии + серверный таймаут.
@@ -422,16 +436,20 @@ class DBManager:
                         rows = await cur.fetchall()
                         return rows if rows is not None else []
 
-            # Серверный таймаут (MAX_EXECUTION_TIME) ставится не всегда:
-            # в режиме readonly=true он не применяется. asyncio.wait_for —
-            # последняя линия защиты от «вечного» запроса.
+            # ВАЖНО: asyncio.wait_for снимает ожидание в Python, но НЕ отменяет
+            # серверный запрос — aiomysql не отправляет KILL QUERY. Основная
+            # защита — MAX_EXECUTION_TIME (ставится в init_command при создании
+            # пула, включая readonly=true). wait_for — страховка от зависания
+            # Python, если серверный таймаут не сработал.
             try:
                 return await asyncio.wait_for(
                     _run_mysql_query(), timeout=self.query_timeout + 2,
                 )
             except asyncio.TimeoutError:
                 raise TimeoutError(
-                    f"Query timeout exceeded ({self.query_timeout} sec)"
+                    f"Query timeout exceeded ({self.query_timeout} sec); "
+                    "серверный запрос мог продолжить выполнение — "
+                    "проверьте slow_query_log."
                 )
 
         elif db_type == 'postgresql':

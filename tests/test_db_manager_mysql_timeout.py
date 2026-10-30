@@ -9,6 +9,7 @@ from __future__ import annotations
 dv_file_version = '261030.02'
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -164,3 +165,75 @@ def test_lock_wait_timeout_from_env(tmp_path: Path, monkeypatch) -> None:
     assert init_cmd is not None
     assert "SET SESSION innodb_lock_wait_timeout = 10" in init_cmd
     assert "SET SESSION lock_wait_timeout = 10" in init_cmd
+
+
+def _make_manager_for_db(
+    tmp_path: Path, db_name: str, db_conf: dict,
+) -> DBManager:
+    """Создаёт DBManager с временным databases.yaml и одной БД."""
+    config_path = tmp_path / "databases.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"databases": {db_name: db_conf}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+    return DBManager(config_path=str(config_path))
+
+
+def _connect_with_mocked_pool(manager: DBManager, db_name: str) -> None:
+    """Вызывает manager.connect() с замоканным aiomysql.create_pool."""
+    with patch(
+        "app.core.db_manager.aiomysql.create_pool",
+        new=AsyncMock(return_value=object()),
+    ):
+        asyncio.run(manager.connect(db_name))
+
+
+def _warning_messages(caplog) -> list[str]:
+    """Возвращает текст всех WARNING-записей из caplog."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+
+
+def test_init_statements_warns_on_semicolon(tmp_path: Path, caplog) -> None:
+    """';' вне строковых литералов в init_statements логирует WARNING.
+
+    Проверяем именно ';' между стейтментами: внутри кавычек '_strip_string_literals'
+    его вырезает, и предупреждение намеренно не срабатывает.
+    """
+    caplog.set_level(logging.WARNING, logger="app.core.db_manager")
+
+    db_conf = _base_conf(
+        init_statements=[
+            "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'; SET SESSION a = 1",
+        ],
+    )
+    manager = _make_manager_for_db(tmp_path, "db", db_conf)
+
+    _connect_with_mocked_pool(manager, "db")
+
+    warnings = _warning_messages(caplog)
+    assert any("init_statements содержит ';'" in msg for msg in warnings), (
+        f"ожидалось предупреждение про ';', получено: {warnings}"
+    )
+
+
+def test_init_statements_no_warning_without_semicolon(
+    tmp_path: Path, caplog,
+) -> None:
+    """Без ';' в init_statements WARNING про ';' не логируется."""
+    caplog.set_level(logging.WARNING, logger="app.core.db_manager")
+
+    db_conf = _base_conf(
+        init_statements=["SET SESSION a = 1", "SET SESSION b = 2"],
+    )
+    manager = _make_manager_for_db(tmp_path, "db", db_conf)
+
+    _connect_with_mocked_pool(manager, "db")
+
+    warnings = _warning_messages(caplog)
+    assert not any(
+        "init_statements содержит ';'" in msg for msg in warnings
+    ), f"не ожидалось предупреждение про ';', получено: {warnings}"
