@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-11-03
+
+### Добавлено
+- **Метка старта/остановки и ротация file-логов.** При запуске в лог пишется
+  `REPDIX START | version=... | started_at=... | pid=...`, при завершении —
+  `REPDIX STOP | version=... | stopped_at=...`, чтобы после обновления/пересоздания
+  контейнера было видно, какая версия поднялась. `audit.log` и `security.log`
+  пишутся через `RotatingFileHandler` (размеры/бэкапы из
+  `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT` и `SECURITY_LOG_MAX_BYTES`/`SECURITY_LOG_BACKUP_COUNT`),
+  а `load_dotenv` вызывается до `_setup_logging`, чтобы эти параметры из `.env`
+  применялись.
+  - `app/main.py` — `_log_startup_banner()`, `_env_int()`, ротация в `_setup_logging()`,
+    метка `REPDIX STOP` в `_shutdown()`; `dv_file_version` → `261103.01`.
+- **Аудит: сквозной `turn_id`.** Каждый входящий запрос получает идентификатор хода
+  (`state.current_turn_id`), который связывает запись `question/answer` и все записи
+  `sql_llm`/`sql_manual` в `audit.log`.
+  - `app/core/engine.py` — `process_message()` генерирует `current_turn_id` и сбрасывает
+    `current_turn_step` / `current_turn_sql_count` / `current_turn_started_at`
+    для каждого сообщения (включая команды).
+  - `app/core/engine.py` — `_log_audit()` пишет `turn_id`, `turn`, `status`
+    (`ok`/`failed`/`truncated`), `sql_count`, `steps_used`, `duration_sec`.
+  - `app/core/engine.py` — `_log_sql_audit()` принимает `state`/`user_id`/`chat_id`/`tool`
+    и пишет `turn_id`, `step`, `user_id`, `chat_id`, `tool`
+    (`execute_sql` / `manual_sql`).
+  - `app/core/engine.py` — новый `_log_turn_summary()` (запись `type: turn_summary`)
+    пишется один раз в конце LLM-хода; для служебных команд не пишется.
+- `README.md` — раздел «Архитектура» (3.1, 3.2) дополнен описанием сквозного аудита по `turn_id`.
+
+### Изменено
+- **Нарезка длинных сообщений Telegram (`_split_long_text`).** Приоритет границ
+  разреза расширен: перевод строки → граница предложения (`. `, `! `, `? ` во
+  второй половине окна) → пробел → жёсткая нарезка. Незакрытые безопасные теги
+  (`<b>`, `<i>`, `<code>`, `<pre>`, `<a>`) закрываются в конце части и заново
+  открываются в начале следующей (для `<a>` сохраняется `href`) — каждая часть
+  остаётся валидным HTML.
+  - `app/interfaces/telegram_adapter.py` — обновлена `_split_long_text()`,
+    добавлен хелпер `_track_open_tags()`; `dv_file_version` → `261030.03`.
+- `README.md` — разделы 3 и 3.1 (Telegram-адаптер) актуализированы под новое
+  поведение нарезки.
+
 ## 2026-10-30
 
 ### Изменено

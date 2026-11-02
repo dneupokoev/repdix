@@ -26,6 +26,8 @@ services:
       # context: ./ (по умолчанию, относительно compose.yaml = корень)
       context: ${REDIS_CONTEXT:-./}
       dockerfile: dockerfiles/redis.dockerfile
+      # network: host — чтобы при сборке был доступ к интернету (если понадобится pip/apt)
+      network: host
     container_name: repdix_redis
     restart: always
     volumes:
@@ -61,6 +63,10 @@ services:
       context: ${APP_CONTEXT:-./}
       # dockerfile: dockerfiles/app.dockerfile (относительно context)
       dockerfile: dockerfiles/app.dockerfile
+      # network: host — критично для доступа к github.com при pip install.
+      # ВНИМАНИЕ: если используете Docker с BuildKit по умолчанию, эта настройка
+      # может игнорироваться. Тогда используйте DOCKER_BUILDKIT=0 docker compose up -d --build
+      network: host
     container_name: repdix_app
     restart: always
     stop_grace_period: 60s

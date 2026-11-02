@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261030.17'
+dv_file_version = '261103.03'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 
 import sqlglot
@@ -157,7 +158,23 @@ def _build_base_prompt(
         "есть факт, ограничивающий область (например, 'работаю только с центром X', "
         "'игнорируй технические звонки'), ты ОБЯЗАН применить его как фильтр в SQL "
         "(WHERE center_name = 'X'), даже если пользователь не повторил это в текущем "
-        "вопросе. Память — это постоянное условие, а не просто контекст.\n\n"
+        "вопросе. Память — это постоянное условие, а не просто контекст.\n"
+        "- БЮДЖЕТ ЗАПРОСОВ: на один вопрос делай НЕ БОЛЕЕ 5 execute_sql. "
+        "Если для ответа достаточно данных — синтезируй вывод, не запрашивай "
+        "дополнительные срезы.\n"
+        "- НЕ ПОВТОРЯЙ запросы с тем же WHERE, меняя только набор колонок. "
+        "Если нужны дополнительные метрики по тем же строкам — бери ВСЕ нужные "
+        "колонки за один запрос.\n"
+        "- Если все метрики лежат в ОДНОЙ таблице — делай ОДИН широкий запрос "
+        "с нужным WHERE и всеми колонками, а не серию узких.\n"
+        "- Если пользователь явно ограничил источник ('не используй таблицу X', "
+        "'используй только агрегированные таблицы') — это правило ПРИОРИТЕТНЕЕ "
+        "любых эвристик. Соблюдай его до конца диалога, даже если история "
+        "сжалась.\n"
+        "- ЕСЛИ SQL УПАЛ (tool вернул 'Ошибка выполнения запроса: ...'), прочитай "
+        "текст ошибки и исправь запрос (опечатка в имени таблицы, лишняя колонка "
+        "в GROUP BY, несуществующее поле). НЕ МЕНЯЙ ТЕМУ и не переключайся на "
+        "другой запрос, пока не исправишь текущий.\n\n"
         "ПРАВИЛА SQL:\n"
         "- ПРАВИЛО ИДЕНТИФИКАТОРОВ (MySQL): ВСЕГДА оборачивай имена таблиц, колонок и "
         "алиасов в обратные кавычки (`). Например: SELECT `center_name`, "
@@ -187,7 +204,11 @@ def _build_base_prompt(
         "- СТРУКТУРИРУЙ ответ. Для сложных вопросов используй короткие разделы: 'Объём', "
         "'Работа операторов', 'Судья', 'Вывод'. Для простых — один абзац.\n"
         "- НЕ ПИШИ ВОДУ. Убирай фразы типа 'как видно из данных', 'стоит отметить', "
-        "'важно понимать'. Сразу к сути.\n\n"
+        "'важно понимать'. Сразу к сути.\n"
+        "- ОТВЕЧАЙ КОМПАКТНО. Если ответ не влезает в ~2500 символов — разбей его "
+        "на 2-3 смысловые части и предложи пользователю написать 'продолжай' для "
+        "следующей части. НЕ обрывай предложение на полуслове и НЕ оставляй "
+        "незакрытые HTML-теги (<b>, <code>).\n\n"
         "КАТЕГОРИЧЕСКОЕ ПРАВИЛО ПО ОТКАЗАМ: Если инструмент вернул сообщение, "
         "начинающееся с '⛔ Доступ запрещен', ты ОБЯЗАН сообщить пользователю "
         "причину отказа из этого сообщения. НЕ придумывай результат, НЕ пиши "
@@ -983,6 +1004,10 @@ class RepdixEngine:
     async def process_message(self, msg: ChatMessage) -> ChatResponse:
         user_id = msg.user_id
         state = self.sessions.get(user_id)
+        state.current_turn_id = uuid.uuid4().hex[:8]
+        state.current_turn_step = 0
+        state.current_turn_sql_count = 0
+        state.current_turn_started_at = datetime.now().isoformat()
         lock = state.lock
 
         # default_schema вычисляется ПОСЛЕ загрузки кэша (см. ниже): до
@@ -1565,7 +1590,12 @@ class RepdixEngine:
                         rows, db_name=state.current_db,
                         schema=schema_part, table_name=table_part,
                     )
-                    self._log_sql_audit(audit_sql, duration, "success", source="manual")
+                    state.current_turn_sql_count += 1
+                    self._log_sql_audit(
+                        audit_sql, duration, "success", source="manual",
+                        state=state, user_id=user_id, chat_id=msg.chat_id,
+                        tool="manual_sql",
+                    )
                     log_manual_sql(
                         user_id=user_id,
                         db_name=state.current_db,
@@ -1580,7 +1610,11 @@ class RepdixEngine:
                 except Exception as e:
                     duration = time.perf_counter() - start_time
                     err_str = str(e)
-                    self._log_sql_audit(audit_sql, duration, "error", err_str, source="manual")
+                    self._log_sql_audit(
+                        audit_sql, duration, "error", err_str, source="manual",
+                        state=state, user_id=user_id, chat_id=msg.chat_id,
+                        tool="manual_sql",
+                    )
                     log_manual_sql(
                         user_id=user_id,
                         db_name=state.current_db,
@@ -1779,6 +1813,7 @@ class RepdixEngine:
 
                 while step < max_steps:
                     step += 1
+                    state.current_turn_step = step
 
                     response = await self.llm_client.chat(
                         messages,
@@ -1867,8 +1902,10 @@ class RepdixEngine:
                                 user_roles = (
                                     self.user_manager.get_user_roles(user_id) or []
                                 )
+                                # Оборачиваем таблицу в кавычки, чтобы sqlglot не упал на спецсимволах
+                                safe_table = f"`{table_name.replace('.', '`.`')}`" if '.' in table_name else f"`{table_name}`"
                                 rbac_ok, rbac_msg = self.rbac.validate_sql(
-                                    f"SELECT 1 FROM {table_name}",
+                                    f"SELECT 1 FROM {safe_table}",
                                     user_roles,
                                     default_schema,
                                 )
@@ -2082,16 +2119,25 @@ class RepdixEngine:
                                 "tool_call_id": tool_call["id"],
                                 "content": result_text,
                             })
-                            self._log_sql_audit(audit_sql, duration, "success", source="llm")
+                            self._log_sql_audit(
+                                audit_sql, duration, "success", source="llm",
+                                state=state, user_id=user_id, chat_id=msg.chat_id,
+                                tool="execute_sql",
+                            )
                             logger.info("Executed SQL: %s", audit_sql)
                             # Запоминаем реальный SQL отдельно (для будущих уточнений)
                             state.last_sqls.append(audit_sql)
+                            state.current_turn_sql_count += 1
                             if len(state.last_sqls) > 20:
                                 state.last_sqls = state.last_sqls[-20:]
                         except Exception as e:
                             duration = time.perf_counter() - start_time
                             err_str = str(e)
-                            self._log_sql_audit(audit_sql, duration, "error", err_str, source="llm")
+                            self._log_sql_audit(
+                                audit_sql, duration, "error", err_str, source="llm",
+                                state=state, user_id=user_id, chat_id=msg.chat_id,
+                                tool="execute_sql",
+                            )
                             if "timeout" in err_str.lower() or "MAX_EXECUTION_TIME" in err_str:
                                 timeout_val = os.environ.get('SQL_QUERY_TIMEOUT', '15')
                                 error_msg = f"Запрос выполнялся слишком долго (лимит {timeout_val} сек) и был прерван."
@@ -2119,7 +2165,45 @@ class RepdixEngine:
                         "content": "Ты уже собрал достаточно данных. НАПИШИ ФИНАЛЬНЫЙ ОТВЕТ ПОЛЬЗОВАТЕЛЮ. Больше не вызывай инструменты.",
                     })
                     final_response = await self.llm_client.chat(messages, tools=None, model_name=model_to_use)
-                    final_text = final_response["choices"][0]["message"].get("content") or ""
+                    choice = final_response["choices"][0]
+                    final_text = choice["message"].get("content") or ""
+                    finish_reason = choice.get("finish_reason")
+
+                    # Модель уперлась в max_tokens (finish_reason="length"):
+                    # дожимаем ответ вторым запросом, иначе пользователь
+                    # получит обрезанный на полуслове текст.
+                    if finish_reason == "length" and final_text:
+                        tail = final_text[-150:]
+                        messages_continue = messages + [
+                            {"role": "assistant", "content": final_text},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Твой предыдущий ответ оборвался из-за лимита длины. "
+                                    "Продолжи ровно с того места, где ты остановился. "
+                                    "Не повторяй уже написанное. Не начинай с вступлений, "
+                                    "просто продолжи текст. Последние символы твоего "
+                                    f"ответа: ...{tail}"
+                                ),
+                            },
+                        ]
+                        try:
+                            response_cont = await self.llm_client.chat(
+                                messages_continue, tools=None,
+                                model_name=model_to_use,
+                            )
+                            cont_text = (
+                                response_cont["choices"][0]["message"].get("content")
+                                or ""
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Не удалось дожать ответ после "
+                                "finish_reason=length: %s", e,
+                            )
+                            cont_text = ""
+                        if cont_text:
+                            final_text = final_text + " " + cont_text
 
                 # Защита от пустого ответа
                 if not final_text or not final_text.strip():
@@ -2148,6 +2232,9 @@ class RepdixEngine:
 
                 audit_answer = final_text
                 self._log_audit(state, msg, audit_question, audit_answer)
+                self._log_turn_summary(
+                    state, user_id, msg.chat_id, audit_question, final_text,
+                )
 
                 if self.show_model_in_response:
                     final_text += f"\n\n_Ответ от модели: {state.last_model_used}_"
@@ -2557,6 +2644,16 @@ class RepdixEngine:
         return expanded
 
     # ---------- Аудит ----------
+    @staticmethod
+    def _classify_answer_status(answer: str) -> str:
+        """Классифицирует итоговый ответ для аудита: failed/truncated/ok."""
+        text = str(answer or "")
+        if text.startswith("⚠️") or text.startswith("⛔") or text.startswith("Ошибка"):
+            return "failed"
+        if text.endswith("..."):
+            return "truncated"
+        return "ok"
+
     def _log_audit(self, state: SessionState, msg: ChatMessage,
                     question: str, answer: str) -> None:
         data = {
@@ -2568,18 +2665,65 @@ class RepdixEngine:
             "db": state.current_db,
             "model": state.current_model or "default",
             "model_used": state.last_model_used,
+            "turn_id": state.current_turn_id,
+            "turn": state.current_turn_step,
+            "status": self._classify_answer_status(answer),
+            "sql_count": state.current_turn_sql_count,
+            "steps_used": state.current_turn_step,
         }
+        if state.current_turn_started_at:
+            data["duration_sec"] = round(
+                (datetime.now() - datetime.fromisoformat(
+                    state.current_turn_started_at
+                )).total_seconds(),
+                3,
+            )
+        audit_logger.info(json.dumps(data, ensure_ascii=False))
+
+    def _log_turn_summary(self, state: SessionState, user_id: str,
+                           chat_id: str, question: str, answer: str) -> None:
+        """Сводка по одному turn: связывает question/answer со step-логами."""
+        data = {
+            "timestamp": datetime.now().isoformat(),
+            "type": "turn_summary",
+            "turn_id": state.current_turn_id,
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "question_preview": str(question or "")[:200],
+            "answer_status": self._classify_answer_status(answer),
+            "sql_count": state.current_turn_sql_count,
+            "steps_used": state.current_turn_step,
+        }
+        if state.current_turn_started_at:
+            data["duration_sec"] = round(
+                (datetime.now() - datetime.fromisoformat(
+                    state.current_turn_started_at
+                )).total_seconds(),
+                3,
+            )
         audit_logger.info(json.dumps(data, ensure_ascii=False))
 
     def _log_sql_audit(self, sql: str, duration: float, status: str,
-                        error: str | None = None, source: str = "llm") -> None:
-        """Пишет SQL-аудит. source: 'llm' (из tool_call) или 'manual' (/sql)."""
+                        error: str | None = None, source: str = "llm", *,
+                        state: SessionState | None = None,
+                        user_id: str | None = None,
+                        chat_id: str | None = None,
+                        tool: str = "execute_sql") -> None:
+        """Пишет SQL-аудит. source: 'llm' (из tool_call) или 'manual' (/sql).
+
+        turn_id/user_id/chat_id/step связывают запись с конкретным turn.
+        """
         data = {
             "timestamp": datetime.now().isoformat(),
             "type": f"sql_{source}",
             "sql": sql,
             "duration_sec": round(duration, 3),
             "status": status,
+            "turn_id": getattr(state, "current_turn_id", "") if state else "",
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "step": getattr(state, "current_turn_step", 0) if state else 0,
+            "tool": tool,
         }
         if error:
             data["error"] = error

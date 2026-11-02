@@ -1,12 +1,14 @@
 # app/main.py
-dv_file_version = '261030.03'
+dv_file_version = '261103.02'
 """Точка входа repdix: выбор адаптера и запуск event loop"""
 
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
 import sys
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -94,6 +96,33 @@ def _setup_logging() -> None:
     security_logger.addHandler(sec_handler)
 
 
+def _log_startup_banner() -> None:
+    """Пишет чёткую метку старта с версией и временем.
+
+    Нужна, чтобы после обновления/пересоздания контейнера было видно,
+    что запущена именно новая версия (а не старый процесс).
+    """
+    started_at = datetime.now().isoformat(timespec="seconds")
+    line = "=" * 60
+    logger.info(line)
+    logger.info(
+        "REPDIX START | version=%s | started_at=%s | pid=%d",
+        dv_file_version,
+        started_at,
+        os.getpid(),
+    )
+    logger.info(line)
+
+    # Дублируем метку старта в audit.log (структурированный JSON).
+    audit_logger = logging.getLogger("audit")
+    audit_logger.info(json.dumps({
+        "timestamp": datetime.now().isoformat(),
+        "type": "startup",
+        "version": dv_file_version,
+        "pid": os.getpid(),
+    }, ensure_ascii=False))
+
+
 # ----------------------------------------------------------------------
 # Инициализация сервисов
 # ----------------------------------------------------------------------
@@ -178,6 +207,11 @@ async def main() -> None:
     # из .env не применяются (молча берутся дефолты).
     load_dotenv(override=False)
     _setup_logging()
+
+    # Чёткая метка старта с версией — сразу после настройки логирования,
+    # чтобы было видно в docker logs, какая версия поднялась.
+    _log_startup_banner()
+
     logger.info(
         "DEBUG main: ADAPTER после load_dotenv=%r",
         os.environ.get("ADAPTER"),
@@ -266,6 +300,20 @@ async def _shutdown(engine: RepdixEngine, adapter) -> None:
             await adapter.close()
         except Exception as e:
             logger.warning("Ошибка закрытия адаптера: %s", e)
+
+    logger.info(
+        "REPDIX STOP | version=%s | stopped_at=%s",
+        dv_file_version,
+        datetime.now().isoformat(timespec="seconds"),
+    )
+
+    # Дублируем метку остановки в audit.log (структурированный JSON).
+    audit_logger = logging.getLogger("audit")
+    audit_logger.info(json.dumps({
+        "timestamp": datetime.now().isoformat(),
+        "type": "shutdown",
+        "version": dv_file_version,
+    }, ensure_ascii=False))
 
     logger.info("repdix остановлен")
 

@@ -30,7 +30,8 @@ repdix/
 │   ├── __init__.py
 │   ├── main.py                 # точка входа: логирование, инициализация сервисов,
 │   │                           # загрузка .env до выбора адаптера, предсказуемый выбор
-│   │                           # адаптера (telegram/cli), диагностика выбора, graceful shutdown
+│   │                           # адаптера (telegram/cli), диагностика выбора, graceful shutdown,
+│   │                           # чёткие метки старта/стопа (REPDIX START/STOP)
 │   ├── core/                   # бизнес-логика (независима от мессенджера)
 │   │   ├── __init__.py
 │   │   ├── cache_manager.py    # Redis (история диалогов, память, session:{user_id});
@@ -50,7 +51,8 @@ repdix/
 │   │   │                       # вызов check_complexity перед выполнением SQL,
 │   │   │                       # _extract_table_from_sql / _extract_last_table_from_history
 │   │   │                       # на sqlglot; проверка is_active и роли sql_executor
-│   │   │                       # для /sql
+│   │   │                       # для /sql; автодополнение ответа при finish_reason="length";
+│   │   │                       # сквозная идентификация запросов через turn_id
 │   │   ├── llm_client.py       # клиент LLM (hot-reload models.yaml, temperature,
 │   │   │                       # max_tokens, fallback tools/tool_choice, orphaned clients)
 │   │   ├── manual_sql_audit.py # аудит ручных /sql-вызовов в logs/manual_sql.log
@@ -58,8 +60,8 @@ repdix/
 │   │   │                       # правила schema.*, защита от P2SQL, expand_select_star,
 │   │   │                       # COUNT(*) не блокируется
 │   │   ├── session.py          # SessionState (история, lock, current_task, last_sqls,
-│   │   │                       # summary, long_term_facts) + SessionStore с TTL
-│   │   │                       # и фоновой очисткой (start_cleanup_task/stop_cleanup_task)
+│   │   │                       # summary, long_term_facts, current_turn_id/step/sql_count)
+│   │   │                       # + SessionStore с TTL и фоновой очисткой
 │   │   ├── sql_complexity.py   # проверка сложности SQL на уровне AST (JOIN, декартово
 │   │   │                       # произведение, глубина подзапросов, UNION); пороги из env;
 │   │   │                       # RecursionError → SQLTooComplex (fail-closed)
@@ -75,9 +77,12 @@ repdix/
 │       ├── base.py             # ChatMessage (с колбэком статуса), ChatResponse
 │       │                       # (с reply_markup), BaseChatInterface
 │       ├── telegram_adapter.py # Telegram (aiogram), FSM-регистрация, HTML-разметка,
+│       │                       # конвертация Markdown → HTML (_convert_markdown_to_html),
+│       │                       # балансировка незакрытых тегов (_balance_html_tags),
 │       │                       # санитайзер HTML, кнопки управления памятью, /stop,
 │       │                       # модерация, админ-панель /users (только env-админы),
-│       │                       # нарезка длинных сообщений не внутри HTML-тегов
+│       │                       # нарезка по предложениям/переводам строк без разрыва
+│       │                       # HTML-тегов, троттлинг статусов (STATUS_MIN_INTERVAL_SEC)
 │       └── cli_adapter.py      # Консольный интерфейс (отладка, CLI_USER_ID)
 ├── config/
 │   ├── databases.yaml          # шаблоны подключений к целевым БД (${VAR} из .env)
@@ -97,9 +102,9 @@ repdix/
 
 ### 3.1. Ключевые модули
 
-- `app/main.py` — запуск приложения, инициализация сервисов, загрузка `.env` **до** `_setup_logging` (иначе `LOG_MAX_BYTES`/`SECURITY_LOG_*` из `.env` не применяются), предсказуемый выбор адаптера (`telegram` или `cli`), диагностика выбора в логах, корректное завершение (`_shutdown`: остановка cleanup-таска, отмена сессий, закрытие пулов БД/LLM/Redis/адаптера). `_env_int` — безопасный парсинг `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`/`SECURITY_LOG_*`.
-- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, вызов `sql_complexity.check_complexity` перед выполнением SQL, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`. `_format_sql_result` кэширует набор текстовых колонок (`_text_columns_cache`, ключ `(db, schema, table)`), чтобы не запрашивать `information_schema` на каждый вызов. `_extract_table_from_sql` и `_extract_last_table_from_history` работают через `sqlglot` (кавычки, CTE, подзапросы; системные таблицы пропускаются). **Проверка `is_active` в начале `process_message`** для всех команд, кроме `/start` и `/help` — заблокированный/неодобренный пользователь получает «заявка на рассмотрении» на любую команду. После LLM-ответа вызывается `_persist_session` (`last_sqls` в `session:{user_id}`); `state.summary` добавляется в `system_content` промпта. `audit.log` и `last_sqls` содержат SQL ДО auto-LIMIT (оригинал), в БД уходит SQL с auto-LIMIT. **Ветка `/sql`** дополнительно проверяет роль `sql_executor` (или `is_admin`) — роль не даёт доступа к таблицам, RBAC проверяет по остальным ролям. **`/sql` не проходит `check_complexity`** — см. раздел 9.
-- `app/core/session.py` — состояние сессии, история, блокировки, активные задачи, резюме диалога (`summary`), долгосрочная память (`long_term_facts`) и TTL-хранилище сессий. **Фоновая очистка** (`start_cleanup_task`/`stop_cleanup_task`, интервал 300 сек) — иначе при малом числе пользователей просроченные сессии жили бы до рестарта. Ленивая очистка `_cleanup_expired` раз в 100 обращений к `get()` сохранена как дополнительный механизм.
+- `app/main.py` — запуск приложения, инициализация сервисов, загрузка `.env` **до** `_setup_logging` (иначе `LOG_MAX_BYTES`/`SECURITY_LOG_*` из `.env` не применяются), предсказуемый выбор адаптера (`telegram` или `cli`), диагностика выбора в логах, корректное завершение (`_shutdown`: остановка cleanup-таска, отмена сессий, закрытие пулов БД/LLM/Redis/адаптера). **Метки старта и стопа:** `_log_startup_banner` пишет `REPDIX START | version=... | started_at=... | pid=...` сразу после настройки логирования, а `_shutdown` пишет `REPDIX STOP | version=... | stopped_at=...` — это позволяет однозначно определить, что контейнер пересоздался именно с новой версией, а не просто перезапустился. `_env_int` — безопасный парсинг `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`/`SECURITY_LOG_*`.
+- `app/core/engine.py` — Agent Loop, вызовы инструментов, проверки RBAC, вызов `sql_complexity.check_complexity` перед выполнением SQL, сборка системного промпта, динамическая схема БД, авто-сжатие истории, управление памятью, авто-развёртывание `SELECT *` в разрешённые поля, безопасное чтение `user_id` и `current_db` через `getattr`. `_format_sql_result` кэширует набор текстовых колонок (`_text_columns_cache`, ключ `(db, schema, table)`), чтобы не запрашивать `information_schema` на каждый вызов. `_extract_table_from_sql` и `_extract_last_table_from_history` работают через `sqlglot` (кавычки, CTE, подзапросы; системные таблицы пропускаются). **Проверка `is_active` в начале `process_message`** для всех команд, кроме `/start` и `/help` — заблокированный/неодобренный пользователь получает «заявка на рассмотрении» на любую команду. После LLM-ответа вызывается `_persist_session` (`last_sqls` в `session:{user_id}`); `state.summary` добавляется в `system_content` промпта. `audit.log` и `last_sqls` содержат SQL ДО auto-LIMIT (оригинал), в БД уходит SQL с auto-LIMIT. **Ветка `/sql`** дополнительно проверяет роль `sql_executor` (или `is_admin`) — роль не даёт доступа к таблицам, RBAC проверяет по остальным ролям. **`/sql` не проходит `check_complexity`** — см. раздел 9. **Защита `get_relations`:** перед вызовом `validate_sql` для проверки доступа к таблице её имя оборачивается в обратные кавычки (`safe_table`), иначе `sqlglot` падает на спецсимволах или составных именах. **Автодополнение ответа:** если модель упёрлась в `max_tokens` (`finish_reason="length"`), ядро делает второй запрос к LLM с просьбой продолжить текст с последних 150 символов, склеивает части и отдаёт пользователю цельный ответ. **Хронология:** в начале `process_message` генерируется `turn_id`, а каждый SQL и финальный ответ логируются с полями `turn_id`, `user_id`, `chat_id`, `step`, `sql_count`, `steps_used`, `duration_sec`, что позволяет восстановить полный ход запроса.
+- `app/core/session.py` — состояние сессии, история, блокировки, активные задачи, резюме диалога (`summary`), долгосрочная память (`long_term_facts`) и TTL-хранилище сессий. **Поля `current_turn_id`, `current_turn_step`, `current_turn_sql_count`, `current_turn_started_at`** добавлены для сквозной идентификации и аналитики по каждому запросу. **Фоновая очистка** (`start_cleanup_task`/`stop_cleanup_task`, интервал 300 сек) — иначе при малом числе пользователей просроченные сессии жили бы до рестарта. Ленивая очистка `_cleanup_expired` раз в 100 обращений к `get()` сохранена как дополнительный механизм.
 - `app/core/db_manager.py` — пулы подключений к MySQL/MariaDB, таймауты, `lock_wait_timeout` (MySQL/MariaDB), read-only-режим, `init_statements`, кэш метаданных и поддержка нескольких схем (`multi-schema`). Перед отправкой запроса в БД SQL-комментарии вырезаются. **Важно:** `CLIENT.MULTI_STATEMENTS` включается **только если `init_cmd` содержит `;`** (несколько `SET SESSION`) — иначе флаг `0`, чтобы не расширять поверхность атаки. Запросы читаются через `fetchmany` (`SSDictCursor`): не более `SQL_FETCH_LIMIT + 1` строк, защита от OOM. При создании MySQL-пула выполняется `SHOW GRANTS FOR CURRENT_USER()`: если у пользователя есть права на запись (включая `FILE`/`SUPER`/`PROCESS`/`RELOAD`/`SHUTDOWN`/`EXECUTE`), в `security.log` пишется WARNING (запуск не блокируется — см. раздел 4.1). `get_schemas(auto)` при сбое возвращает `[]` (а не fallback-схему) — чтобы LLM не получила ложную картину. `execute_query` содержит комментарий: `asyncio.wait_for` не отменяет серверный запрос, основная защита — `MAX_EXECUTION_TIME`.
 - `app/core/llm_client.py` — клиент LLM, hot-reload `models.yaml`, `max_tokens`, `temperature`, fallback на `tool_choice`/`tools` при ошибках API. При hot-reload, если event loop закрыт, старый клиент попадает в `_orphaned_clients` и закрывается в `close()` (иначе утечка соединений).
 - `app/core/cache_manager.py` — Redis-кэш истории диалогов, памяти и `session:{user_id}`, graceful degradation при недоступности Redis. Redis-клиент создаётся без `retry_on_timeout`. **Fail-fast:** открытый в сеть Redis без пароля на не-loopback хосте запрещён (CVE-2025-21605).
@@ -110,17 +115,22 @@ repdix/
 - `app/core/user_manager.py` — модерация пользователей, hot-reload `users.yaml`, защита администраторов (env-админы не перезаписываются и не удаляются), атомарная запись через `os.replace` с `fsync` (защита от потери `users.yaml` при падении питания). **Блокировка отзывает роли:** `reject_user` и `toggle_user_active` (при `new_active=False`) очищают `roles` — иначе заблокированный пользователь с сохранёнными ролями (включая `sql_executor`) продолжил бы иметь доступ к `/sql`. Разблокировка **не** восстанавливает роли автоматически — админ назначает заново.
 - `app/core/manual_sql_audit.py` — аудит ручных `/sql`-вызовов в отдельный `logs/manual_sql.log` (полный SQL, `user_id`, `db_name`, длительность, результат). Ограничений на сложность `/sql` нет — см. раздел 9. Ротация: `LOG_MAX_BYTES`/`LOG_BACKUP_COUNT`. При ошибке открытия файла — graceful degradation (WARNING, аудит отключён).
 - `app/interfaces/base.py` — абстрактные интерфейсы сообщений (`ChatMessage`) и ответов (`ChatResponse`, включая `reply_markup`).
-- `app/interfaces/telegram_adapter.py` — Telegram-адаптер: FSM-регистрация, HTML-разметка ответов (`parse_mode`), санитайзер HTML (`sanitize_telegram_html`: безопасные теги сохраняются, опасные экранируются; для `<a>` разрешены только `http(s)://` и `tg://`), отправка статусов с HTML-разметкой, кнопки управления памятью, `/stop`, модерация, админ-панель `/users` (только env-админы). **Нарезка длинных сообщений** (`_split_long_text`) не попадает внутрь HTML-тега `<...>` (иначе Telegram отклоняет разметку).
+- `app/interfaces/telegram_adapter.py` — Telegram-адаптер: FSM-регистрация, HTML-разметка ответов (`parse_mode`), конвертация Markdown → HTML (`_convert_markdown_to_html`: `**жирный**` → `<b>`, `*курсив*` → `<i>`, заголовки `##`/`###` в начале строки → `<b>…</b>`, маркеры списка `- ` → `• `; выполняется до санитизации, поэтому полученные `<b>`/`<i>` сохраняются), балансировка тегов (`_balance_html_tags`: лишние закрывающие удаляются, недостающие дописываются в конец), санитайзер HTML (`sanitize_telegram_html`: безопасные теги сохраняются, опасные экранируются; для `<a>` разрешены только `http(s)://` и `tg://`), отправка статусов с HTML-разметкой, кнопки управления памятью, `/stop`, модерация, админ-панель `/users` (только env-админы). **Порядок обработки ответа:** `_convert_markdown_to_html` → `_balance_html_tags` → `sanitize_telegram_html` (в `_answer_html`, для каждой части). **Нарезка длинных сообщений** (`_split_long_text`) не попадает внутрь HTML-тега `<...>` (иначе Telegram отклоняет разметку), а приоритет границ разреза — перевод строки → граница предложения (`. `, `! `, `? ` во второй половине окна) → пробел → жёсткая нарезка. Каждая часть отдельно проходит конвертацию и балансировку (функции идемпотентны), поэтому разрыв пары тегов при нарезке не приводит к отказу Telegram. **Троттлинг статусов:** промежуточные статусы Chain of Thought отправляются не чаще, чем раз в `STATUS_MIN_INTERVAL_SEC` секунд (по умолчанию 10), чтобы не спамить пользователя при длинных цепочках SQL.
 - `app/interfaces/cli_adapter.py` — консольный адаптер для отладки. Предупреждает, если `CLI_USER_ID` не админ (RBAC заблокирует таблицы). `Ctrl+C` отменяет текущий запрос (аналог `/stop`; в CLI сам `/stop` уходит в LLM — используйте `Ctrl+C`).
 
 ### 3.2. Поток обработки запроса
 
 1. Адаптер (`telegram_adapter.py` или `cli_adapter.py`) принимает сообщение пользователя и передаёт его в ядро.
-2. `engine.process_message` **проверяет `is_active`** для всех команд, кроме `/start` и `/help`: заблокированный/неодобренный пользователь получает «заявка на рассмотрении» и не доходит до команд.
+2. `engine.process_message` **проверяет `is_active`** для всех команд, кроме `/start` и `/help`: заблокированный/неодобренный пользователь получает «заявка на рассмотрении» и не доходит до команд. Затем генерируется `turn_id` и сбрасываются счётчики шагов/SQL для текущего запроса.
 3. `engine.py` формирует системный промпт с учётом динамической схемы БД, истории, долгосрочной памяти и RBAC-правил.
 4. LLM вызывает инструменты (`execute_sql`, `get_relations`), ядро валидирует SQL через `validator.py`, проверяет доступ через `rbac_guard.py`, проверяет сложность через `sql_complexity.py` и скрывает технические объекты через `technical_filter.py`. При отказе RBAC именно из-за `SELECT *` (при наличии `allowed_columns`/`excluded_columns`) ядро пытается развернуть звёздочку в разрешённые поля и повторить валидацию. При отказе `check_complexity` запрос **не выполняется**, модели возвращается tool-сообщение с причиной, чтобы она переформулировала запрос или попросила пользователя уточнить вопрос.
 5. `db_manager.py` выполняет запрос в целевой БД с учётом таймаутов, `lock_wait_timeout` и read-only-режима. Перед отправкой запроса SQL-комментарии вырезаются (`strip_sql_comments`); в аудит и `last_sqls` пишется оригинал.
-6. Статусы Chain of Thought отправляются через `status_callback`; ответ пользователю рендерится адаптером (в Telegram — с `parse_mode=HTML`, после `sanitize_telegram_html`).
+6. Статусы Chain of Thought отправляются через `status_callback` (с троттлингом в адаптере); ответ пользователю рендерится адаптером. В Telegram текст проходит цепочку `_convert_markdown_to_html` → `_balance_html_tags` → `sanitize_telegram_html` и отправляется с `parse_mode=HTML`; при отказе Telegram разметка отбрасывается и сообщение уходит как обычный текст.
+7. Все записи `audit.log` за один запрос (`question/answer`, `sql_llm`/`sql_manual`, `turn_summary`) связаны общим `turn_id` — по нему можно восстановить полный ход: вопрос, цепочку SQL и финальный ответ.
+
+**Ошибки SQL и отказы в LLM-ветке.** Полный текст ошибки выполнения запроса, а также причина отказа `validate_sql` и RBAC возвращаются модели tool-сообщением с инструкцией «Исправь SQL и повтори» (для ошибок выполнения — «прочитай текст ошибки и исправь SQL … не меняй тему», для таймаута — «упрости запрос (меньше JOIN, уже WHERE) и повтори, не меняя тему»): модель исправляет запрос (опечатка в имени таблицы, лишняя колонка в `GROUP BY`, несуществующее поле, слишком тяжёлый запрос), а не теряет контекст. Сам текст причины отказа (`reason`/`rbac_msg`) не изменяется. Пользователь видит только финальный ответ; ветка `/sql` не затронута — там ошибка показывается пользователю.
+
+**Обрыв генерации (`finish_reason="length"`).** Если модель упёрлась в лимит `max_tokens` (например, на длинном аналитическом выводе), ядро не отдаёт пользователю обрубок: оно берёт последние 150 символов сгенерированного текста, делает второй запрос к LLM с просьбой продолжить ровно с этого места, склеивает части и отдаёт цельный ответ. Это позволяет держать `max_tokens` небольшим (например, 3000) для экономии токенов и при этом получать полные ответы.
 
 ## 🗄️ 4. Работа с базами данных
 
@@ -178,7 +188,7 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 В `engine.py` реализован цикл `while step < max_steps`. Лимит шагов задаётся переменной окружения `AGENT_MAX_STEPS` (по умолчанию 10, минимум 1): пяти шагов не хватало сложным вопросам (несколько SQL подряд + финальный вывод). Модель может: изучить структуру таблиц (из системного промпта), выполнить несколько SQL-запросов, сравнить результаты и написать бизнес-вывод. Если цикл оборвался по лимиту и модель так и не вернула текст, в лог пишется `WARNING "Agent loop reached max_steps"` с полями `steps`, `max_steps`, `user_id`; затем модели отправляется system-сообщение с требованием написать финальный ответ (без инструментов).
 **Важно:** В цикле сообщения модели обязательно передаются с ролью `"tool"` и `tool_call_id`, иначе DeepSeek вернёт ошибку 400.
 
-В системный промпт добавлено правило обрамления идентификаторов MySQL обратными кавычками. При формировании простых ответов имена таблиц скрываются от пользователя. Для экономии токенов в `config/models.yaml` можно задать `max_tokens` (лимит длины ответа).
+В системный промпт добавлено правило обрамления идентификаторов MySQL обратными кавычками. При формировании простых ответов имена таблиц скрываются от пользователя. Для экономии токенов в `config/models.yaml` можно задать `max_tokens` (лимит длины ответа). Если модель всё же упрётся в него (`finish_reason="length"`), ядро автоматически сделает второй запрос и допишет ответ (см. п. 3.2 «Обрыв генерации»).
 
 **Неизвестные инструменты:** если LLM вернула `tool_call` с именем, отличным от `execute_sql`/`get_relations`, ядро логирует WARNING и возвращает модели tool-сообщение `Ошибка: неизвестный инструмент '<name>'` (без выполнения).
 
@@ -189,11 +199,13 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 
 **Важно:** если модель вернула `tool_calls`, но пустой `content`, статус формируется как `🤖 Выполняю <tool_name>...`. Если `content` непустой — он очищается от HTML-тегов и схлопывается в одну строку (статусы — plain text).
 
+**Троттлинг статусов:** чтобы не спамить пользователя при длинных цепочках SQL, промежуточные статусы отправляются не чаще, чем раз в `STATUS_MIN_INTERVAL_SEC` секунд (по умолчанию 10). Счётчик сбрасывается при завершении запроса. Финальный ответ отправляется всегда.
+
 ### 5.3. Инструменты модели (Tool Calling)
 
 Доступны инструменты:
 - `execute_sql` — для сложных аналитических SELECT-запросов. Перед выполнением проходит `validator.validate_sql`, `rbac_guard.validate_sql` и `sql_complexity.check_complexity`.
-- `get_relations` — узнать связи таблиц. Проходит проверку `is_technical_qualified` для имени таблицы и RBAC через `validate_sql("SELECT 1 FROM <table>")`. Связи фильтруются: технические колонки и таблицы-цели (`ref_table`) скрываются.
+- `get_relations` — узнать связи таблиц. Проходит проверку `is_technical_qualified` для имени таблицы и RBAC через `validate_sql("SELECT 1 FROM <table>")`. Имя таблицы перед подстановкой в `validate_sql` оборачивается в обратные кавычки (`safe_table`), иначе `sqlglot` падает на спецсимволах или составных именах. Связи фильтруются: технические колонки и таблицы-цели (`ref_table`) скрываются.
 - **⚠️ Важно:** `SHOW COLUMNS` и `SHOW TABLES` **не пройдут** `validator.validate_sql` — только `SELECT` и `WITH`. Вся нужная информация о структуре уже в промпте (динамическая схема).
 
 ### 5.4. Управление историей, контекстом и долгосрочной памятью
@@ -260,7 +272,7 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 4. Запустите Redis (опционально — бот работает и без него, но история/память/сессия не кэшируются).
 5. Запустите `./prj_start.sh` (или `python -m app.main`).
 
-При старте `.env` загружается **до** `_setup_logging()` (`load_dotenv(override=False)` → `_setup_logging()`), поэтому `LOG_MAX_BYTES`/`SECURITY_LOG_*` из `.env` применяются. Выбранный адаптер (`telegram`/`cli`) и причина выбора пишутся в лог.
+При старте `.env` загружается **до** `_setup_logging()` (`load_dotenv(override=False)` → `_setup_logging()`), поэтому `LOG_MAX_BYTES`/`SECURITY_LOG_*` из `.env` применяются. Выбранный адаптер (`telegram`/`cli`) и причина выбора пишутся в лог. В `docker logs` (или консоли) первой содержательной строкой будет `REPDIX START | version=...`, а при остановке — `REPDIX STOP | version=...`.
 
 **⚠️ Важно про CLI и `pipenv run`:** `pipenv run` загружает `.env` раньше, чем `main()`, и **перезаписывает** env-переменные из командной строки. Поэтому `ADAPTER=cli pipenv run python -m app.main` запустит **Telegram** (если в `.env` `ADAPTER=telegram`), а не CLI. Диагностика в `_build_adapter` предупредит об этом WARNING'ом.
 
@@ -318,6 +330,7 @@ SESSION_TTL_SEC=86400       # 24 часа
 AGENT_MAX_STEPS=10          # лимит шагов Agent Loop (минимум 1)
 SHOW_MODEL_IN_RESPONSE=false
 SCHEMA_CACHE_TTL_SEC=3600       # TTL кэша схемы БД (сек)
+STATUS_MIN_INTERVAL_SEC=10      # троттлинг статусов Chain of Thought (сек)
 
 # Проверка сложности SQL (check_complexity)
 SQL_MAX_JOINS=5
@@ -347,7 +360,9 @@ models:
     api_key: ${LLM_TOOL_TOKEN}
     supports_tools: true
     temperature: 0.0
-    max_tokens: 1500         # лимит длины ответа (экономия токенов)
+    max_tokens: 3000         # лимит длины ответа (экономия токенов).
+                             # Если модель упрётся в него, engine.py автоматически
+                             # допишет ответ вторым запросом (см. п. 3.2).
     context_length: 32768
 ```
 
@@ -443,17 +458,17 @@ users:
 - **RBAC:** qualified-таблицы, `SELECT *` + excluded/allowed, обход через смену схемы, системные таблицы, P2SQL, `COUNT(*)`, неквалифицированные колонки при нескольких таблицах, `expand_select_star`.
 - **SQL-сложность:** JOIN, декартово произведение, глубина подзапросов, UNION, fail-closed, `RecursionError` → `SQLTooComplex`, неподдерживаемые диалекты → `ValueError`.
 - **Менеджер БД:** `init_command` (readonly + таймаут, MariaDB `max_statement_time`, `init_statements`, warning про `;`, `client_flag` MULTI_STATEMENTS только при `;`), `get_schemas` (explicit, fallback, auto, auto failure → `[]`), `get_table_list`, кэш, проверка `SHOW GRANTS` (`tests/test_db_manager_grants.py`: read-only → нет WARNING; `ALL PRIVILEGES`/`INSERT`/`FILE` → WARNING в `security.log`; ошибка `SHOW GRANTS` → WARNING в app-лог, не падает).
-- **Ядро:** `_extract_table_from_sql` и `_extract_last_table_from_history` (кавычки, CTE, подзапросы, системные таблицы), `AGENT_MAX_STEPS`, `expand_select_star` (успех/неудача/логирование), кэш `text_columns`, защита от не-SQL `rbac_msg`.
+- **Ядро:** `_extract_table_from_sql` и `_extract_last_table_from_history` (кавычки, CTE, подзапросы, системные таблицы), `AGENT_MAX_STEPS`, `expand_select_star` (успех/неудача/логирование), кэш `text_columns`, защита от не-SQL `rbac_msg`, `turn_id`/`turn_summary` (связь question/SQL по общему id), автодополнение при `finish_reason="length"`, защита `get_relations` (обёртка таблицы в обратные кавычки).
 - **Проверка доступа:** `tests/test_engine_active_check.py` — `is_active` для всех команд (кроме `/start`, `/help`), роль `sql_executor` в `/sql`, админ обходит проверку.
 - **LLM-клиент:** кэширование клиентов, hot-reload, `_orphaned_clients` в `close()`.
-- **Сессии:** фоновая очистка TTL, идемпотентность `start_cleanup_task`/`stop_cleanup_task`, сохранение активных задач.
-- **Telegram-адаптер:** `_split_long_text` (не внутри HTML-тегов), `sanitize_telegram_html` (`<script>` экранируется, безопасные теги сохраняются, `javascript:` отсекается).
+- **Сессии:** фоновая очистка TTL, идемпотентность `start_cleanup_task`/`stop_cleanup_task`, сохранение активных задач, поля `current_turn_*`.
+- **Telegram-адаптер:** `_split_long_text` (не внутри HTML-тегов), `sanitize_telegram_html` (`<script>` экранируется, безопасные теги сохраняются, `javascript:` отсекается), `_balance_html_tags` (недостающие закрывающие дописываются, лишние удаляются), `_convert_markdown_to_html` (`**` → `<b>`, `##` → `<b>`), троттлинг статусов (`STATUS_MIN_INTERVAL_SEC`).
 - **Пользователи:** `_save_users_yaml` вызывает `fsync`, `OSError` не ломает запись; `reject_user`/`toggle_user_active` очищают `roles` при блокировке.
 - **Аудит `/sql`:** успех и ошибка пишутся в `manual_sql.log`.
 - **Форматирование SQL:** пусто, одна строка, много колонок, обрезка.
 - **Технический фильтр:** `is_technical`, `is_technical_qualified`, env-префиксы.
 - **`_env_int`:** invalid → default + WARNING, zero/negative → minimum, empty → default.
-- **Логирование при старте:** `tests/test_main_logging.py` — `load_dotenv` до `_setup_logging` (иначе `LOG_MAX_BYTES` из `.env` не применяется).
+- **Логирование при старте:** `tests/test_main_logging.py` — `load_dotenv` до `_setup_logging` (иначе `LOG_MAX_BYTES` из `.env` не применяется), а также метки `REPDIX START`/`REPDIX STOP` с версией.
 
 Запуск: `pytest -v`.
 
@@ -464,5 +479,4 @@ users:
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 - **Автор:** Дмитрий Неупокоев
-- **GitHub:** [github.com/dneupokoev](https://github.com/dneupokoev)
 - **Репозиторий проекта:** [github.com/dneupokoev/repdix](https://github.com/dneupokoev/repdix)

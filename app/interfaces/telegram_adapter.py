@@ -1,5 +1,5 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261030.02'
+dv_file_version = '261103.01'
 """Telegram-адаптер на aiogram 3"""
 
 import asyncio
@@ -7,6 +7,7 @@ import html
 import logging
 import os
 import re
+import time
 
 import yaml
 from aiogram import Bot, Dispatcher, F, types
@@ -93,6 +94,57 @@ def sanitize_telegram_html(text: str) -> str:
     result = html.escape(masked)
     for idx, tag in enumerate(placeholders):
         result = result.replace(f"\x00{idx}\x00", tag)
+    return _balance_html_tags(result)
+
+
+def _balance_html_tags(text: str) -> str:
+    """Балансирует безопасные HTML-теги в тексте.
+
+    Проходит по тексту, ведёт стек открытых тегов:
+    * открывающий тег — push в стек;
+    * закрывающий тег при совпадении с вершиной стека — pop;
+    * лишний закрывающий тег (стек пуст или вершина не совпадает) —
+      удаляется из текста.
+
+    В конце к строке дописываются закрывающие теги для всех оставшихся
+    в стеке элементов в обратном порядке.
+
+    Args:
+        text: Текст после восстановления безопасных тегов.
+
+    Returns:
+        Текст с корректно сбалансированной HTML-разметкой.
+    """
+    if not text:
+        return ""
+
+    stack: list[str] = []
+    pieces: list[str] = []
+    last = 0
+
+    for match in _TAG_RE.finditer(text):
+        name = match.group(1).lower()
+        if name not in _SAFE_TAGS:
+            continue
+
+        if not match.group(0).startswith("</"):
+            stack.append(name)
+            continue
+
+        if stack and stack[-1] == name:
+            stack.pop()
+            continue
+
+        # Лишний закрывающий тег — удаляем его из текста.
+        pieces.append(text[last:match.start()])
+        last = match.end()
+
+    pieces.append(text[last:])
+    result = "".join(pieces)
+
+    for name in reversed(stack):
+        result += f"</{name}>"
+
     return result
 
 
@@ -225,6 +277,13 @@ class TelegramAdapter(BaseChatInterface):
         self.bot = Bot(token=os.environ["TELEGRAM_TOKEN"])
         self.dp = Dispatcher()
         self.user_manager = engine.user_manager
+
+        # Троттлинг промежуточных статусов Chain of Thought: не чаще, чем
+        # раз в STATUS_MIN_INTERVAL_SEC секунд на пользователя.
+        self._last_status_sent_at: dict[str, float] = {}
+        self._status_min_interval_sec: float = float(
+            os.environ.get("STATUS_MIN_INTERVAL_SEC") or "19"
+        )
 
     # ------------------------------------------------------------------
     # Env-админы (для /users и меню)
@@ -1685,6 +1744,12 @@ class TelegramAdapter(BaseChatInterface):
                 return
 
         async def send_status(status_text: str):
+            now = time.monotonic()
+            last = self._last_status_sent_at.get(user_id, 0.0)
+            if now - last < self._status_min_interval_sec:
+                return
+            self._last_status_sent_at[user_id] = now
+
             # status_text формирует LLM (по промпту — <b>/<code>). Полный
             # html.escape превратил бы теги в &lt;b&gt;, поэтому применяем
             # санитайзер: безопасные теги остаются, опасные экранируются.
@@ -1731,6 +1796,7 @@ class TelegramAdapter(BaseChatInterface):
                 except Exception:
                     pass
             finally:
+                self._last_status_sent_at.pop(user_id, None)
                 if session_state.current_task is asyncio.current_task():
                     session_state.current_task = None
 

@@ -1,5 +1,5 @@
 # app/core/session.py
-dv_file_version = '261030.02'
+dv_file_version = '261103.02'
 """Состояние сессии пользователя для repdix."""
 
 import asyncio
@@ -31,6 +31,14 @@ class SessionState:
         summary: Краткое резюме старого диалога (auto-compact).
         long_term_facts: Задел на долговременную память (пока не используется).
         last_access: time.monotonic() последнего обращения (для TTL).
+        current_turn_id: Короткий uuid-подобный id текущего вопроса (turn).
+            Позволяет сквозную идентификацию одной пользовательской итерации
+            в логах/аудите Agent Loop.
+        current_turn_step: Номер шага Agent Loop в рамках текущего turn.
+            Сбрасывается в 0 при начале нового вопроса.
+        current_turn_sql_count: Количество успешно выполненных SQL
+            в рамках текущего turn.
+        current_turn_started_at: ISO-время начала обработки текущего вопроса.
     """
 
     user_id: str
@@ -44,6 +52,10 @@ class SessionState:
     summary: str = ""
     long_term_facts: list[str] = field(default_factory=list)
     last_access: float = field(default_factory=time.monotonic)
+    current_turn_id: str = ""
+    current_turn_step: int = 0
+    current_turn_sql_count: int = 0
+    current_turn_started_at: str = ""
 
 
 class SessionStore:
