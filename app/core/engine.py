@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261103.03'
+dv_file_version = '261103.04'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -2169,10 +2169,23 @@ class RepdixEngine:
                     final_text = choice["message"].get("content") or ""
                     finish_reason = choice.get("finish_reason")
 
-                    # Модель уперлась в max_tokens (finish_reason="length"):
-                    # дожимаем ответ вторым запросом, иначе пользователь
+                    # Обрыв ответа: либо модель уперлась в max_tokens
+                    # (finish_reason="length"), либо текст не заканчивается
+                    # знаком препинания / закрытым HTML-тегом / закрывающей
+                    # скобкой (модель оборвалась на полуслове даже при
+                    # finish_reason="stop"). Текст, оканчивающийся на
+                    # "</b>", "</i>", "</code>" и т.п., считается завершённым:
+                    # последний символ ">" входит в список.
+                    is_truncated = finish_reason == "length" or (
+                        bool(final_text)
+                        and not final_text.strip().endswith(
+                            (".", "!", "?", ">", "`", ")", "]")
+                        )
+                    )
+
+                    # Дожимаем ответ вторым запросом, иначе пользователь
                     # получит обрезанный на полуслове текст.
-                    if finish_reason == "length" and final_text:
+                    if is_truncated and final_text:
                         tail = final_text[-150:]
                         messages_continue = messages + [
                             {"role": "assistant", "content": final_text},
