@@ -1,5 +1,5 @@
 # app/core/engine.py
-dv_file_version = '261103.04'
+dv_file_version = '261103.06'
 """Ядро repdix: диспетчер сообщений, не зависящий от мессенджера."""
 
 import asyncio
@@ -1020,16 +1020,13 @@ class RepdixEngine:
 
         await lock.acquire()
         try:
-            text = msg.text.strip()
-            audit_question = text
+            # text может быть пустым, если пришло только изображение:
+            # команды и детерминированные ветки ниже такое просто не матчат.
+            text = (msg.text or "").strip()
+            audit_question = text or "[изображение]"
             audit_answer = ""
 
             # Проверка активности — кроме /start и /help (нужны для регистрации).
-            # Раньше сервисные команды (/db, /model, /settings, /sql, /remember)
-            # пропускались мимо is_user_active в handle_message — заблокированный
-            # пользователь с сохранёнными ролями мог выполнить /sql через RBAC,
-            # а неодобренный — увидеть /settings (утечка метаданных) или
-            # засорить Redis через /remember.
             if (
                 self.user_manager
                 and text not in ("/start", "/help")
@@ -1066,11 +1063,9 @@ class RepdixEngine:
                     except json.JSONDecodeError:
                         payload = None
                     if isinstance(payload, dict):
-                        # Новый формат: {"history": [...], "summary": "..."}
                         state.history = payload.get("history") or []
                         state.summary = payload.get("summary") or ""
                     elif isinstance(payload, list):
-                        # Совместимость со старым форматом (только история)
                         state.history = payload
                     else:
                         state.history = []
@@ -1078,8 +1073,6 @@ class RepdixEngine:
                     state.history = []
 
                 # Долгосрочная память (repdix:memory:{user_id}, TTL 30 дней).
-                # Не обнуляем список, если ключа нет: факты, добавленные в этой
-                # сессии через /remember, должны остаться в памяти процесса.
                 mem_key = f"repdix:memory:{user_id}"
                 mem_raw = await self.cache_manager.get(mem_key)
                 if mem_raw:
@@ -1091,8 +1084,7 @@ class RepdixEngine:
                         state.long_term_facts = [str(f) for f in loaded_facts]
 
                 # Выбранная БД/модель, резюме и последние SQL: отдельный ключ
-                # session:{user_id} (формат — JSON-объект). Битый/отсутствующий
-                # ключ НЕ сбрасывает значения, уже установленные в этой сессии.
+                # session:{user_id} (формат — JSON-объект).
                 session_raw = await self.cache_manager.get(f"session:{user_id}")
                 if session_raw:
                     try:
@@ -1102,7 +1094,6 @@ class RepdixEngine:
                     if isinstance(session_payload, dict):
                         restored_db = session_payload.get("current_db")
                         if isinstance(restored_db, str) and restored_db:
-                            # Не восстанавливаем БД, которой больше нет в конфиге.
                             known_dbs = (
                                 self.db_manager.get_db_names()
                                 if self.db_manager is not None else [restored_db]
@@ -1473,9 +1464,6 @@ class RepdixEngine:
                 state.last_model_used = "algorithm (command)"
                 sql = text[5:].strip()
 
-                # /sql — только для активных пользователей с ролью sql_executor
-                # (или админов). Роль sql_executor не даёт доступа к таблицам —
-                # только право на /sql; RBAC проверяет таблицы по остальным ролям.
                 if self.user_manager:
                     user_roles_check = self.user_manager.get_user_roles(user_id) or []
                     is_admin_user = self.user_manager.is_admin(user_id)
@@ -1503,10 +1491,6 @@ class RepdixEngine:
                     self._log_audit(state, msg, audit_question, audit_answer)
                     return ChatResponse(text=audit_answer)
 
-                # RBAC + технический фильтр.
-                # ВАЖНО: проверка выполняется и для админов — иначе технические
-                # таблицы/колонки доступны в обход RBAC (и вместо отказа виден
-                # "Результат: пусто"). Админ обходит только обычные RBAC-правила.
                 if self.user_manager:
                     user_roles = self.user_manager.get_user_roles(user_id) or []
                     default_schema = self._get_default_schema(state)
@@ -1517,10 +1501,6 @@ class RepdixEngine:
                     rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
                     technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
 
-                    # SELECT * по таблице с ограниченным набором полей:
-                    # пробуем развернуть звёздочку в явный список разрешённых
-                    # полей (RBAC при этом не ослабляется — результат
-                    # повторно валидируется).
                     if (
                         not rbac_ok
                         and not technical_denied
@@ -1538,7 +1518,6 @@ class RepdixEngine:
                         if "admin" in user_roles and not technical_denied:
                             logger.info("/sql: admin bypass for non-technical SQL")
                             rbac_ok = True
-                            # sql оставляем как есть — это осознанный обход для админа
                         else:
                             log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
                             audit_answer = f"⛔ Доступ запрещен: {rbac_msg}"
@@ -1547,9 +1526,6 @@ class RepdixEngine:
                             self._log_audit(state, msg, audit_question, audit_answer)
                             return ChatResponse(text=audit_answer)
                     else:
-                        # Подставляем rbac_msg в sql только если это действительно
-                        # SQL (начинается с SELECT/WITH).
-                        # Защита от изменения контракта validate_sql.
                         candidate = (rbac_msg or "").strip()
                         if (
                             candidate
@@ -1565,17 +1541,8 @@ class RepdixEngine:
                     self._log_audit(state, msg, audit_question, audit_answer)
                     return ChatResponse(text=audit_answer)
 
-                # auto-LIMIT (защита от OOM): /sql не проходит
-                # check_complexity и раньше не получал LIMIT, поэтому
-                # "SELECT * FROM huge" тянул весь результат в память.
-                # audit_sql — ДО auto-LIMIT: audit.log и last_sqls содержат то,
-                # что пользователь реально написал (for forensics). sql_for_exec —
-                # после auto-LIMIT и strip_sql_comments (то, что уходит в БД).
                 audit_sql = sql
                 sql = self._apply_sql_limit(sql)
-
-                # В БД — без комментариев (чистое имя колонки в ответе:
-                # cursor.description иначе вернёт "1 -- ; DROP TABLE x").
                 sql_for_exec = strip_sql_comments(sql)
 
                 start_time = time.perf_counter()
@@ -1633,7 +1600,13 @@ class RepdixEngine:
                     return ChatResponse(text=audit_answer)
 
             # ---------- Детерминированный запрос имени таблицы ----------
-            if state.current_db is not None and re.fullmatch(r"[a-zA-Z0-9_]+", text):
+            # При наличии изображения текст — это подпись к фото, а не имя
+            # таблицы: детерминированная ветка не должна «съедать» картинку.
+            if (
+                not msg.image_base64
+                and state.current_db is not None
+                and re.fullmatch(r"[a-zA-Z0-9_]+", text)
+            ):
                 state.last_model_used = "algorithm (deterministic)"
                 recent_history_text = " ".join(
                     str(m.get("content", "")) for m in state.history[-2:]
@@ -1710,8 +1683,6 @@ class RepdixEngine:
                 )
                 schema = await self._get_db_schema(state, msg.text)
 
-                # Последние выполненные SQL: модель может сделать "то же самое,
-                # но за сентябрь", не угадывая запрос заново.
                 last_sqls_block = ""
                 if state.last_sqls:
                     recent_sqls = state.last_sqls[-3:]
@@ -1732,16 +1703,11 @@ class RepdixEngine:
                     + (("\n\n" + schema) if schema else "")
                 )
 
-                # Резюме предыдущего диалога (auto-compact). Без этого после
-                # 2-3 обрезок истории суть диалога теряется, хотя state.summary
-                # сохраняется в Redis и README 5.4 обещает его использовать.
                 if state.summary:
                     system_content += (
                         "\n\nРезюме предыдущего диалога: " + state.summary
                     )
 
-                # Долгосрочная память: факты, которые пользователь просил
-                # запомнить (/remember). Модель обязана их учитывать.
                 if state.long_term_facts:
                     system_content += (
                         "\n\nДолгосрочная память пользователя "
@@ -1749,8 +1715,7 @@ class RepdixEngine:
                         + "\n".join(f"- {fact}" for fact in state.long_term_facts)
                     )
 
-                # Подсказка о последней таблице
-                text_lower = msg.text.lower()
+                text_lower = msg.text.lower() if msg.text else ""
                 if any(marker in text_lower for marker in TIME_MARKERS):
                     last_table = self._extract_last_table_from_history(state)
                     if last_table:
@@ -1759,14 +1724,10 @@ class RepdixEngine:
                             "Если имя таблицы не указано явно, используй её для запросов о датах."
                         )
 
-                # Проверка контекста
                 context_limit = self.llm_client.get_context_length(model_to_use)
                 history_chars = sum(len(str(m)) for m in state.history)
                 estimated_tokens = (len(system_content) + history_chars + len(msg.text)) // 3
 
-                # Auto-Compact: при 60% лимита сжимаем НАЧАЛО истории в резюме.
-                # Так бот не упирается в лимит и не теряет суть диалога
-                # (жёсткая обрезка по 10 сообщениям резала контекст целиком).
                 if estimated_tokens > context_limit * 0.6 and len(state.history) >= 4:
                     compacted = await self._compact_history(
                         state, model_to_use, state.history[:4],
@@ -1802,9 +1763,32 @@ class RepdixEngine:
                         self._log_audit(state, msg, audit_question, audit_answer)
                         return ChatResponse(text=audit_answer)
 
+                if msg.image_base64:
+                    system_content += (
+                        "\n\nПользователь прислал изображение. Проанализируй его "
+                        "и ответь по существу; при необходимости используй "
+                        "инструменты для сверки данных."
+                    )
+
                 messages: list[dict] = [{"role": "system", "content": system_content}]
                 messages.extend(state.history[-self.max_history:])
-                messages.append({"role": "user", "content": msg.text})
+
+                if msg.image_base64:
+                    user_content = [
+                        {
+                            "type": "text",
+                            "text": msg.text or "Проанализируй это изображение.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{msg.image_base64}",
+                            },
+                        },
+                    ]
+                else:
+                    user_content = msg.text
+                messages.append({"role": "user", "content": user_content})
 
                 # ---------- ЦИКЛ АГЕНТА (до 5 шагов) ----------
                 max_steps = self.agent_max_steps
@@ -1824,16 +1808,11 @@ class RepdixEngine:
                     choice = response["choices"][0]["message"]
                     tool_calls = choice.get("tool_calls")
 
-                    # Статус — только если модель реально вызывает инструмент
                     if tool_calls and msg.status_callback:
-                        # ВАЖНО: НЕ обрезаем текст — обрезка могла разорвать
-                        # HTML-тег (<b>...</b>) и Telegram отвечал
-                        # "Can't parse entities". Разметку отдаём как есть,
-                        # лишь схлопываем пробелы в одну строку и снимаем теги.
                         clean_text = re.sub(
                             r"\s+", " ", choice.get("content") or "",
                         ).strip()
-                        clean_text = re.sub(r"<[^>]+>", "", clean_text)  # статусы — plain text, без HTML
+                        clean_text = re.sub(r"<[^>]+>", "", clean_text)
                         if clean_text:
                             await msg.status_callback(f"🤖 {clean_text}")
                         else:
@@ -1883,8 +1862,6 @@ class RepdixEngine:
                                 })
                                 continue
 
-                            # Технические таблицы не раскрываем даже на уровне
-                            # метаданных (как в _get_relations_text).
                             if is_technical_qualified(table_name):
                                 messages.append({
                                     "role": "tool",
@@ -1893,16 +1870,10 @@ class RepdixEngine:
                                 })
                                 continue
 
-                            # RBAC: таблица должна быть разрешена пользователю.
-                            # Проверяем через validate_sql на простом SELECT —
-                            # отдельного метода для метаданных связей нет.
-                            # Если user_manager не подключён — проверка
-                            # пропускается (как в остальных ветках).
                             if self.user_manager:
                                 user_roles = (
                                     self.user_manager.get_user_roles(user_id) or []
                                 )
-                                # Оборачиваем таблицу в кавычки, чтобы sqlglot не упал на спецсимволах
                                 safe_table = f"`{table_name.replace('.', '`.`')}`" if '.' in table_name else f"`{table_name}`"
                                 rbac_ok, rbac_msg = self.rbac.validate_sql(
                                     f"SELECT 1 FROM {safe_table}",
@@ -1929,10 +1900,6 @@ class RepdixEngine:
 
                             table_relations = relations_data.get(table_name, [])
 
-                            # Технический фильтр связей: колонки и таблицы-цели
-                            # (ref_table из references) скрываем так же, как
-                            # в _get_relations_text. RBAC для ref_table не
-                            # применяем — это метаданные, а не доступ к данным.
                             filtered_relations = []
                             for rel in table_relations:
                                 col = str(rel.get("column", ""))
@@ -1983,8 +1950,6 @@ class RepdixEngine:
                             })
                             continue
 
-                        # RBAC + технический фильтр (админы тоже проверяются:
-                        # технические таблицы/колонки запрещены всем ролям).
                         if self.user_manager:
                             user_roles = self.user_manager.get_user_roles(user_id) or []
                             logger.info(
@@ -1994,8 +1959,6 @@ class RepdixEngine:
                             rbac_ok, rbac_msg = self.rbac.validate_sql(sql, user_roles, default_schema)
                             technical_denied = (not rbac_ok) and "technical" in (rbac_msg or "").lower()
 
-                            # Мягкий выход из отказа по SELECT *: разворачиваем
-                            # звёздочку в разрешённые поля и валидируем снова.
                             if (
                                 not rbac_ok
                                 and not technical_denied
@@ -2013,7 +1976,6 @@ class RepdixEngine:
                                 if "admin" in user_roles and not technical_denied:
                                     logger.info("tool_call: admin bypass for non-technical SQL")
                                     rbac_ok = True
-                                    # sql оставляем как есть — это осознанный обход для админа
                                 else:
                                     log_violation(user_id or "unknown", sql, f"RBAC: {rbac_msg}")
                                     messages.append({
@@ -2026,9 +1988,6 @@ class RepdixEngine:
                                     })
                                     continue
                             else:
-                                # Подставляем rbac_msg в sql только если это
-                                # действительно SQL (начинается с SELECT/WITH).
-                                # Защита от изменения контракта validate_sql.
                                 candidate = (rbac_msg or "").strip()
                                 if (
                                     candidate
@@ -2045,10 +2004,6 @@ class RepdixEngine:
                             })
                             continue
 
-                        # Проверка сложности SQL — ПОСЛЕ RBAC и ДО выполнения.
-                        # Отказ уходит модели как tool-сообщение (как и ошибки
-                        # validate_sql): она может переформулировать запрос,
-                        # пользователю ошибка не отправляется.
                         try:
                             check_complexity(
                                 sql,
@@ -2078,9 +2033,6 @@ class RepdixEngine:
                             })
                             continue
 
-                        # Защита от переполнения контекста: если нет LIMIT — добавляем.
-                        # Для агрегатных запросов (GROUP BY, COUNT/SUM/MIN/MAX/AVG)
-                        # LIMIT бессмысленен — не добавляем и не засоряем лог.
                         has_aggregate = (
                             "group by" in sql.lower()
                             or re.search(
@@ -2089,9 +2041,6 @@ class RepdixEngine:
                                 re.IGNORECASE,
                             )
                         )
-                        # audit_sql — ДО auto-LIMIT: audit.log и last_sqls содержат оригинал
-                        # (for forensics). sql_for_exec — после auto-LIMIT и strip_sql_comments
-                        # (то, что уходит в БД).
                         audit_sql = sql
                         if "limit" not in sql.lower() and not has_aggregate:
                             if "text_transcrib" in sql.lower() or "dialog_from_whisper" in sql.lower():
@@ -2125,7 +2074,6 @@ class RepdixEngine:
                                 tool="execute_sql",
                             )
                             logger.info("Executed SQL: %s", audit_sql)
-                            # Запоминаем реальный SQL отдельно (для будущих уточнений)
                             state.last_sqls.append(audit_sql)
                             state.current_turn_sql_count += 1
                             if len(state.last_sqls) > 20:
@@ -2218,29 +2166,21 @@ class RepdixEngine:
                         if cont_text:
                             final_text = final_text + " " + cont_text
 
-                # Защита от пустого ответа
                 if not final_text or not final_text.strip():
                     final_text = "⚠️ Я собрал данные, но не смог сформулировать вывод. Попробуйте уточнить вопрос."
 
-                # Ужимаем длинные оправдания
                 lower_text = final_text.lower()
                 if "доступ запрещен" in lower_text or "извините" in lower_text or "к сожалению" in lower_text:
                     if len(final_text) > 150:
                         final_text = "⛔ Нет доступа к данным."
 
-                # Обрезка по max_message_length (а не жёсткие 2000)
                 if len(final_text) > self.max_message_length:
                     final_text = final_text[:self.max_message_length - 3] + "..."
 
-                # Убираем псевдо-вызовы
                 final_text = re.sub(r"execute_sql\s*\([^)]*\)", "", final_text).strip()
 
                 await self._save_history(state, user_id, msg.text, final_text)
 
-                # Персистим current_db/current_model/summary/last_sqls в session:{user_id}.
-                # Без этого last_sqls, добавленные в LLM-ветке (state.last_sqls.append),
-                # не сохраняются до следующего /db /model /clear /compact /reset —
-                # после рестарта теряются, хотя README 3.1 обещает обратное.
                 await self._persist_session(state, user_id)
 
                 audit_answer = final_text
@@ -2510,11 +2450,8 @@ class RepdixEngine:
         state.history.append({"role": "user", "content": user_text})
         state.history.append({"role": "assistant", "content": assistant_text})
 
-        # Обрезаем: оставляем последние max_history сообщений, но system-сообщения
-        # [executed_sql] удаляем в первую очередь (они не несут диалоговой ценности).
         if len(state.history) > self.max_history:
             trimmed = state.history[-self.max_history:]
-            # Удаляем ведущие system-сообщения (executed_sql) из начала
             while trimmed and trimmed[0].get("role") == "system":
                 trimmed.pop(0)
             state.history = trimmed
@@ -2618,17 +2555,12 @@ class RepdixEngine:
         Returns:
             Валидный SQL или None, если «починить» запрос не удалось.
         """
-        # state может быть заглушкой без user_id (например, в тестах) —
-        # доступ к атрибуту через getattr, чтобы не падать с AttributeError.
         user_id_for_log = getattr(state, "user_id", None) or "unknown"
 
         expanded = await self._expand_select_star_sql(
             sql, state, user_roles, default_schema,
         )
         if not expanded:
-            # Это не нарушение безопасности, а неудачная попытка «починить»
-            # SELECT *. Пишем в audit.log, не в security.log, чтобы не
-            # засорять security-лог ложными срабатываниями.
             audit_logger.info(json.dumps({
                 "timestamp": datetime.now().isoformat(),
                 "type": "expand_select_star_failed",

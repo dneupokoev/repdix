@@ -1,5 +1,5 @@
 # app/interfaces/base.py
-dv_file_version = '261029.05'
+dv_file_version = '261103.01'
 """Базовые интерфейсы и DTO для адаптеров мессенджеров."""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -8,12 +8,18 @@ from typing import Any, Callable, Awaitable, Optional
 
 @dataclass
 class ChatMessage:
-    """Входящее сообщение от пользователя."""
+    """Входящее сообщение от пользователя.
+
+    image_base64 — необязательное изображение в base64 (без data:-префикса).
+    Ядро не зависит от мессенджера: адаптер сам скачивает и кодирует файл,
+    а engine передаёт его в LLM как image_url (data:image/jpeg;base64,...).
+    """
 
     user_id: str
     chat_id: str
     text: str
     status_callback: Optional[Callable[[str], Awaitable[None]]] = None
+    image_base64: Optional[str] = None
 
 
 @dataclass

@@ -1,8 +1,9 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261103.02'
+dv_file_version = '261103.04'
 """Telegram-адаптер на aiogram 3"""
 
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -315,6 +316,23 @@ class TelegramAdapter(BaseChatInterface):
             os.environ.get("STATUS_MIN_INTERVAL_SEC") or "19"
         )
 
+        # Лимит размера принимаемого изображения (байты). Telegram отдаёт
+        # фото до 10 МБ, base64 увеличивает размер примерно на треть.
+        try:
+            self.max_image_bytes = max(
+                1,
+                int(
+                    os.environ.get("MAX_IMAGE_BYTES")
+                    or str(10 * 1024 * 1024)
+                ),
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Некорректное значение MAX_IMAGE_BYTES=%r, использую 10485760",
+                os.environ.get("MAX_IMAGE_BYTES"),
+            )
+            self.max_image_bytes = 10 * 1024 * 1024
+
     # ------------------------------------------------------------------
     # Env-админы (для /users и меню)
     # ------------------------------------------------------------------
@@ -437,6 +455,9 @@ class TelegramAdapter(BaseChatInterface):
         # --- FSM-память (ввод нового / изменённого факта) ---
         self.dp.message.register(self.process_memory_edit, MemoryState.editing)
         self.dp.message.register(self.process_memory_add, MemoryState.adding)
+
+        # --- Изображения (ДО handle_non_text: у него фильтр ~F.text) ---
+        self.dp.message.register(self.handle_photo, F.photo)
 
         # --- Не-текстовые сообщения ---
         self.dp.message.register(self.handle_non_text, ~F.text)
@@ -1756,6 +1777,114 @@ class TelegramAdapter(BaseChatInterface):
     # ------------------------------------------------------------------
     async def handle_non_text(self, message: types.Message) -> None:
         await message.answer("⚠️ Я понимаю только текстовые сообщения. Напишите вопрос словами.")
+
+    # ------------------------------------------------------------------
+    # Изображения
+    # ------------------------------------------------------------------
+    async def handle_photo(self, message: types.Message, state: FSMContext) -> None:
+        """Обработка фотографии: скачивает её и передаёт в ядро вместе с подписью."""
+        user_id = str(message.from_user.id)
+        caption = (message.caption or "").strip()
+
+        if not self.user_manager.is_admin(user_id) and not self.user_manager.is_user_active(user_id):
+            await self.handle_start_or_unknown(message, state)
+            return
+
+        # Команду в подписи к фото не поддерживаем: /db, /sql и т.п.
+        # ожидают текст, а не изображение.
+        if caption.startswith("/"):
+            await message.answer(
+                "⚠️ Команды отправляйте отдельным сообщением, без изображения."
+            )
+            return
+
+        if not message.photo:
+            await message.answer("⚠️ Не удалось получить изображение.")
+            return
+
+        # message.photo отсортирован по возрастанию размера — берём лучшее.
+        photo = message.photo[-1]
+        if photo.file_size and photo.file_size > self.max_image_bytes:
+            await message.answer(
+                "⚠️ Изображение слишком большое "
+                f"(максимум {self.max_image_bytes // (1024 * 1024)} МБ)."
+            )
+            return
+
+        try:
+            file = await self.bot.get_file(photo.file_id)
+            buffer = await self.bot.download_file(file.file_path)
+            image_base64 = base64.b64encode(buffer.read()).decode("ascii")
+        except Exception as e:
+            logger.error("Не удалось скачать изображение из Telegram: %s", e)
+            await message.answer(
+                "⚠️ Не удалось загрузить изображение. Попробуйте ещё раз."
+            )
+            return
+
+        async def send_status(status_text: str) -> None:
+            now = time.monotonic()
+            last = self._last_status_sent_at.get(user_id, 0.0)
+            if now - last < self._status_min_interval_sec:
+                return
+            self._last_status_sent_at[user_id] = now
+
+            safe_status = sanitize_telegram_html(status_text)
+            try:
+                await message.answer(safe_status, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(
+                    "Failed to send status with HTML (%s), retrying as plain text",
+                    e,
+                )
+                try:
+                    await message.answer(status_text, parse_mode=None)
+                except Exception as e2:
+                    logger.warning("Failed to send status: %s", e2)
+
+        msg = ChatMessage(
+            user_id=user_id,
+            chat_id=str(message.chat.id),
+            text=caption or "Проанализируй это изображение.",
+            image_base64=image_base64,
+            status_callback=send_status,
+        )
+
+        session_state = self.engine.sessions.get(user_id)
+
+        async def run_and_reply() -> None:
+            try:
+                result: ChatResponse = await self.engine.process_message(msg)
+                await self._send_long_message(
+                    message, result.text, reply_markup=result.reply_markup,
+                )
+            except asyncio.CancelledError:
+                try:
+                    await message.answer("⛔ Выполнение прервано командой /stop.")
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                logger.exception("Error in photo task: %s", e)
+                try:
+                    await message.answer(
+                        "⚠️ Произошла ошибка при обработке изображения."
+                    )
+                except Exception:
+                    pass
+            finally:
+                self._last_status_sent_at.pop(user_id, None)
+                if session_state.current_task is asyncio.current_task():
+                    session_state.current_task = None
+
+        if session_state.current_task and not session_state.current_task.done():
+            await message.answer(
+                "⏳ Пожалуйста, дождитесь ответа или отправьте /stop для отмены."
+            )
+            return
+
+        task = asyncio.create_task(run_and_reply())
+        session_state.current_task = task
 
     # ------------------------------------------------------------------
     # Обработка входящего текста
