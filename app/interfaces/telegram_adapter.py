@@ -1,5 +1,5 @@
 # app/interfaces/telegram_adapter.py
-dv_file_version = '261103.01'
+dv_file_version = '261103.02'
 """Telegram-адаптер на aiogram 3"""
 
 import asyncio
@@ -97,20 +97,33 @@ def sanitize_telegram_html(text: str) -> str:
     return _balance_html_tags(result)
 
 
-def _balance_html_tags(text: str) -> str:
+# Максимальная длина содержимого парного тега (<b>...</b>). Если разметка
+# получилась длиннее, оба тега удаляются: лучше без выделения, чем жирный
+# текст на несколько абзацев.
+MAX_TAG_CONTENT_CHARS = 500
+
+
+def _balance_html_tags(text: str, max_open_chars: int = 300) -> str:
     """Балансирует безопасные HTML-теги в тексте.
 
-    Проходит по тексту, ведёт стек открытых тегов:
+    Проходит по тексту, ведёт стек открытых тегов (имя + позиция):
+
     * открывающий тег — push в стек;
-    * закрывающий тег при совпадении с вершиной стека — pop;
+    * закрывающий тег при совпадении с вершиной стека — pop; если текст
+      внутри пары длиннее ``MAX_TAG_CONTENT_CHARS``, удаляются оба тега;
     * лишний закрывающий тег (стек пуст или вершина не совпадает) —
       удаляется из текста.
 
-    В конце к строке дописываются закрывающие теги для всех оставшихся
-    в стеке элементов в обратном порядке.
+    В конце для оставшихся в стеке тегов:
+    * если с момента открытия прошло больше ``max_open_chars`` символов —
+      открывающий тег удаляется (незакрытый тег не должен «красить» весь
+      остаток ответа);
+    * иначе к строке дописываются закрывающие теги в обратном порядке.
 
     Args:
         text: Текст после восстановления безопасных тегов.
+        max_open_chars: Сколько символов незакрытый тег может висеть,
+            прежде чем будет удалён.
 
     Returns:
         Текст с корректно сбалансированной HTML-разметкой.
@@ -118,34 +131,51 @@ def _balance_html_tags(text: str) -> str:
     if not text:
         return ""
 
-    stack: list[str] = []
-    pieces: list[str] = []
-    last = 0
+    stack: list[tuple[str, int, int]] = []  # (имя, начало тега, конец тега)
+    removals: list[tuple[int, int]] = []    # диапазоны, которые надо вырезать
 
     for match in _TAG_RE.finditer(text):
         name = match.group(1).lower()
         if name not in _SAFE_TAGS:
             continue
 
+        start, end = match.start(), match.end()
+
         if not match.group(0).startswith("</"):
-            stack.append(name)
+            stack.append((name, start, end))
             continue
 
-        if stack and stack[-1] == name:
-            stack.pop()
+        if stack and stack[-1][0] == name:
+            _open_name, open_start, open_end = stack.pop()
+            # Пара <tag>...</tag> слишком длинная — убираем оба тега.
+            if start - open_end > MAX_TAG_CONTENT_CHARS:
+                removals.append((open_start, open_end))
+                removals.append((start, end))
             continue
 
         # Лишний закрывающий тег — удаляем его из текста.
-        pieces.append(text[last:match.start()])
-        last = match.end()
+        removals.append((start, end))
 
+    tail_parts: list[str] = []
+    for name, open_start, open_end in reversed(stack):
+        if len(text) - open_end > max_open_chars:
+            # Незакрытый тег «висит» слишком долго — удаляем открывающий.
+            removals.append((open_start, open_end))
+        else:
+            tail_parts.append(f"</{name}>")
+
+    pieces: list[str] = []
+    last = 0
+    for remove_start, remove_end in sorted(removals):
+        if remove_start < last:
+            remove_start = last
+        if remove_end <= remove_start:
+            continue
+        pieces.append(text[last:remove_start])
+        last = remove_end
     pieces.append(text[last:])
-    result = "".join(pieces)
 
-    for name in reversed(stack):
-        result += f"</{name}>"
-
-    return result
+    return "".join(pieces) + "".join(tail_parts)
 
 
 # ----------------------------------------------------------------------
