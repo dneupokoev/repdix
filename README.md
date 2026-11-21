@@ -1,6 +1,7 @@
 <p align="center">
   <img src="repdix.png" alt="repdix banner" width="100%">
 </p>
+
 # 📘 Проект: repdix (Reporting & Data eXplorer)
 
 **💡 AI-аналитик** — Telegram-бот-оркестратор аналитики: переводит вопросы на естественном языке в SQL и возвращает глубокий аналитический ответ.
